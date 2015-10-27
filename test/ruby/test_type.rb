@@ -1,11 +1,6 @@
-require 'set'
-require './test_config'
-require 'typelib'
-require 'test/unit'
-require BUILDDIR + '/ruby/libtest_ruby'
-require 'pp'
+require 'typelib/test'
 
-class TC_Type < Test::Unit::TestCase
+class TC_Type < Minitest::Test
     include Typelib
     def teardown
 	GC.start
@@ -38,9 +33,22 @@ class TC_Type < Test::Unit::TestCase
         assert !(type == Object.new)
     end
 
+    def test_base_type_class_can_be_compared_to_another_class
+        assert(Typelib::Type == Typelib::Type)
+        assert(Typelib::Type != Class.new)
+    end
+    def test_base_type_class_can_be_compared_to_another_type
+        assert(CXXRegistry.new.get("/int32_t") != Typelib::Type)
+        assert(Typelib::Type != CXXRegistry.new.get("/int32_t"))
+    end
     def test_base_type_classes_can_be_compared
         assert(Typelib::CompoundType == Typelib::CompoundType)
         assert(Typelib::CompoundType != Object.new)
+    end
+
+    def test_can_compare_a_type_with_a_base_type_class
+        double_t = CXXRegistry.new.get('/double')
+        assert(double_t != Typelib::NumericType)
     end
 
     def test_casts_to
@@ -76,9 +84,9 @@ class TC_Type < Test::Unit::TestCase
 
     def test_pointer
         type = CXXRegistry.new.build("/int*")
-        assert_not_equal(type, type.deference)
-        assert_not_equal(type, type.to_ptr)
-        assert_not_equal(type.to_ptr, type.deference)
+        refute_equal(type, type.deference)
+        refute_equal(type, type.to_ptr)
+        refute_equal(type.to_ptr, type.deference)
         assert_equal(type, type.deference.to_ptr)
         assert_equal(type, type.to_ptr.deference)
     end
@@ -104,6 +112,27 @@ class TC_Type < Test::Unit::TestCase
             :FLAG_MEMCPY, 17]
 
         assert_equal(expected, layout)
+    end
+
+    def test_marshalling_unmarshalling_without_padding
+        reg = Typelib::CXXRegistry.new
+        type0 = reg.create_compound '/Source' do |c|
+            c.add 'a', '/int32_t', 0
+            c.add 'b', '/double', 10
+        end
+        type1 = reg.create_compound '/Target' do |c|
+            c.add 'a', '/int32_t', 0
+            c.add 'b', '/double', 20
+        end
+
+        v = type0.new
+        v.zero!
+        v.a = 10
+        v.b = 20
+        marshalled = v.to_byte_array(:merge_skip_copy => false)
+        unmarshalled = type1.from_buffer(marshalled, :merge_skip_copy => false)
+        assert_equal 10, unmarshalled.a
+        assert_in_delta 20, unmarshalled.b, 0.001
     end
 end
 

@@ -13,6 +13,9 @@ module Typelib
         ALLOWED_OVERLOADINGS = allowed_overloadings.to_set
 
         class << self
+            # The metadata object
+            attr_reader :metadata
+
             # Definition of the unique convertion that should be used to convert
             # this type into a Ruby object
             #
@@ -32,6 +35,22 @@ module Typelib
 
             attr_predicate :contains_converted_types?, true
 
+            # Returns whether one needs to call Typelib.to_ruby to convert this
+            # type to the type expected by the caller
+            #
+            # @return [Boolean]
+            def needs_convertion_to_ruby?
+                convertion_to_ruby && !convertion_to_ruby[1][:builtin]
+            end
+
+            # Returns whether one needs to call Typelib.from_ruby to convert a
+            # value given to the API to something this type can understand
+            #
+            # @return [Boolean]
+            def needs_convertion_from_ruby?
+                !convertions_from_ruby.empty?
+            end
+
             def compatible_with_memcpy?
                 layout = begin memory_layout
                          rescue
@@ -48,6 +67,51 @@ module Typelib
             def define_method_if_possible(name, &block)
                 Typelib.define_method_if_possible(self, self, name, Type::ALLOWED_OVERLOADINGS, &block)
             end
+
+            # Returns the description of a type using only simple ruby objects
+            # (Hash, Array, Numeric and String).
+            #
+            # The exact set of returned values is dependent on the exact type.
+            # See the documentation of {to_h} on the subclasses of Type for more
+            # details
+            #
+            # Some fields are always present, see {to_h_minimal}
+            #
+            # @option options [Boolean] :recursive (false) if true, the value
+            #   returned by types that refer to other types (e.g. an array) will
+            #   contain the reference's full definition. Otherwise, only the
+            #   value returned by {to_h_minimal} will be stored in the
+            #   type's description
+            # @option options [Boolean] :layout_info (false) if true, add binary
+            #   layout information from the type
+            #
+            # @return [Hash]
+            def to_h(options = Hash.new)
+                to_h_minimal(options)
+            end
+
+            # Returns the minimal description of a type using only simple ruby
+            # objects (Hash, Array, Numeric and String).
+            #
+            #    { 'name' => TypeName,
+            #      'class' => NameOfTypeClass, # CompoundType, ...
+            #      'size' => SizeOfTypeInBytes # Only if :layout_info is true
+            #    }
+            #
+            # It is mainly used as a helper by sub-types {to_h} method when
+            # :recursive is false
+            #
+            # @option options [Boolean] :layout_info (false) if true, add binary
+            #   layout information from the type
+            #
+            # @return [Hash]
+            def to_h_minimal(options = Hash.new)
+                result = Hash[name: name, class: superclass.name]
+                if options[:layout_info]
+                    result[:size] = size
+                end
+                result
+            end
         end
         @convertions_from_ruby = Hash.new
 
@@ -60,7 +124,7 @@ module Typelib
 
         # @deprecated
         #
-        # Replaced by {recursive_dependencies}
+        # Replaced by {direct_dependencies}
         def self.dependencies
             direct_dependencies
         end
@@ -97,15 +161,21 @@ module Typelib
         # given block on C++/Ruby bondary
         def self.convert_to_ruby(to = nil, options = Hash.new, &block)
             options = Kernel.validate_options options,
-                :recursive => true
+                recursive: true,
+                builtin: false
 
-            block = lambda(&block)
-            m = Module.new do
-		define_method(:to_ruby, &block)
+            if !options[:builtin] && !block
+                raise ArgumentError, "not a builtin conversion and no block given"
             end
-            extend(m)
 
-            options[:block] = block
+            if block
+                block = lambda(&block)
+                m = Module.new do
+                    define_method(:to_ruby, &block)
+                end
+                extend(m)
+                options[:block] = block
+            end
 
             self.contains_converted_types = options[:recursive]
             self.convertion_to_ruby = [to, options]
@@ -235,14 +305,14 @@ module Typelib
             end
         end
 
-        # Computes the paths that will allow to enumerate all containers
-        # contained in values of this type
+        # Computes the paths that will enumerate all cached containers contained
+        # in values of this type
         #
         # It is mostly useful in Type#handle_invalidation
         # 
         # @return [Accessor]
         def self.containers_accessor
-            @containers ||= Accessor.find_in_type(self.class) do |t|
+            @containers ||= Accessor.find_in_type(self, :raw_get_cached, :raw_each_cached) do |t|
                 t <= Typelib::ContainerType
             end
         end
@@ -261,9 +331,17 @@ module Typelib
             if containers.empty?
                 yield
             else
+                # Calling #pop is right there. We call
+                # #handle_container_invalidation recursively, which means that
+                # the first invalidation routine to be called is the one of the
+                # last call, i.e. the first element in 'containers'
+                #
+                # In other words, we do invalidate the toplevel containers
+                # first, thus making sure that we don't access the innermost
+                # invalidated containers while they already have been deleted
                 v = containers.pop
                 v.handle_container_invalidation do
-                    handle_container_invalidation(containers, &block)
+                    handle_invalidation_protect_containers(containers, &block)
                 end
             end
         end
@@ -340,6 +418,13 @@ module Typelib
                 Typelib.basename(name, separator)
             end
 
+            # Returns the elements of this type name
+            #
+            # @return [Array<String>]
+            def split_typename
+                Typelib.split_typename(name)
+            end
+
             # Returns the complete name for the type (both namespace and
             # basename). If +separator+ is set to a value different than
             # Typelib::NAMESPACE_SEPARATOR, Typelib's namespace separator will
@@ -351,7 +436,7 @@ module Typelib
             #
             # will return the C++ name for the given type
 	    def full_name(separator = Typelib::NAMESPACE_SEPARATOR, remove_leading = false)
-		result = namespace(separator, remove_leading) + basename(separator)
+		namespace(separator, remove_leading) + basename(separator)
 	    end
 
 	    def to_s; "#<#{superclass.name}: #{name}>" end
@@ -368,11 +453,45 @@ module Typelib
 	    # Returns the pointer-to-self type
             def to_ptr; registry.build(name + "*") end
 
-            def pretty_print(pp) # :nodoc:
+            # Given a markdown-formatted string, return what should be displayed
+            # as text
+            def pp_doc(pp, doc)
+                if !doc.empty?
+                    first_line = true
+                    doc = doc.split("\n").map do |line|
+                        if first_line
+                            first_line = false
+                            "/** " + line
+                        else " * " + line
+                        end
+                    end
+                    if doc.size == 1
+                        doc[0] << " */"
+                    else
+                        doc << " */"
+                    end
+
+                    first_line = true
+                    doc.each do |line|
+                        if !first_line
+                            pp.breakable
+                        end
+                        pp.text line
+                        first_line = false
+                    end
+                    true
+                end
+            end
+
+            def pretty_print(pp, with_doc = true) # :nodoc:
+                # Metadata is nil on the "root" models, e.g. CompoundType
+                if with_doc && metadata && (doc = metadata.get('doc').first)
+                    if pp_doc(pp, doc)
+                        pp.breakable
+                    end
+                end
 		pp.text name 
 	    end
-
-            alias :__real_new__ :new
 
             # Creates a new value from either a MemoryZone instance (i.e. a
             # pointer), or from a marshalled version of a value.
@@ -397,15 +516,58 @@ module Typelib
             def wrap(ptr)
 		if null?
 		    raise TypeError, "this is a null type"
-                elsif !(ptr.kind_of?(String) || ptr.kind_of?(MemoryZone))
+                elsif ptr.kind_of?(String)
+                    new_value = from_buffer(ptr)
+                elsif ptr.kind_of?(MemoryZone)
+                    new_value = from_memory_zone(ptr)
+                else
                     raise ArgumentError, "can only wrap strings and memory zones"
 		end
-                new_value = __real_new__(ptr) 
+
                 if size = new_value.marshalling_size
                     Typelib.add_allocated_memory(size)
                 end
                 new_value
 	    end
+
+            # Allocates a new Typelib object that is initialized from the information
+            # given in the passed string
+            #
+            # The options given here have to be exactly the same than the ones
+            # given to #to_byte_array
+            # 
+            # @param [String] buffer
+            # @option options [Boolean] accept_pointers (false) whether pointers, when
+            #   present, should cause an exception to be raised or simply
+            #   ignored
+            # @option options [Boolean] accept_opaques (false) whether opaques, when
+            #   present, should cause an exception to be raised or simply
+            #   ignored
+            # @option options [Boolean] merge_skip_copy (true) whether padding
+            #   bytes should be marshalled as well when adjacent to non-padding
+            #   bytes, to reduce CPU load at the expense of I/O. When set to
+            #   false, padding bytes are removed completely.
+            # @option options [Boolean] remove_trailing_skips (true) whether
+            #   padding bytes at the end of the value should be marshalled or
+            #   not.
+            # @return [Typelib::Type]
+            def from_buffer(string, options = Hash.new)
+                new.from_buffer(string, options)
+            end
+
+            # Creates a Typelib wrapper that gives access to the memory
+            # pointed-to by the given FFI pointer
+            #
+            # The returned Typelib object will not care about deallocating the
+            # memory
+            #
+            # @param [FFI::Pointer] ffi_ptr the memory address at which the
+            #   value is
+            # @return [Type] the typelib object that gives access to the data
+            #   pointed-to by ffi_ptr
+            def from_ffi(ffi_ptr)
+                from_address(ffi_ptr.address)
+            end
 
             # Creates a new value of the given type.
             #
@@ -415,7 +577,9 @@ module Typelib
                 if init
                     Typelib.from_ruby(init, self)
                 else
-                    __real_new__(nil)
+                    new_value = value_new
+                    new_value.send(:initialize)
+                    new_value
                 end
             end
 
@@ -431,20 +595,73 @@ module Typelib
 		    self <= typename
 		end
 	    end
+
+            # @return [String] a XML representation of this type
+            def to_xml
+                registry.minimal(name, true).to_xml
+            end
+
+            def initialize_base_class
+                @__guard_type = Typelib::Registry.new(false).create_null('/Typelib/Type')
+                @type = @__guard_type.
+                    instance_variable_get(:@type)
+            end
+        end
+
+        # Reinitializes this value to match marshalled data
+        #
+        # @param [String] string the buffer with marshalled data
+        def from_buffer(string, options = Hash.new)
+            options = Type.validate_layout_options(options)
+            from_buffer_direct(string,
+                               options[:accept_pointers],
+                               options[:accept_opaques],
+                               options[:merge_skip_copy],
+                               options[:remove_trailing_skips])
+        end
+
+        # "Raw" version of {#from_buffer}
+        #
+        # This is a version of #from_buffer without named parameters. It is
+        # provided mainly for libraries that are unmarshalling a lot of typelib
+        # samples, to remove the overhead of option validation
+        def from_buffer_direct(string, accept_pointers = false, accept_opaques = false, merge_skip_copy = true, remove_trailing_skips = true)
+            allocating_operation do
+                do_from_buffer(string, 
+                               accept_pointers,
+                               accept_opaques,
+                               merge_skip_copy,
+                               remove_trailing_skips)
+            end
+            self
         end
 
         # Returns a string whose content is a marshalled representation of the memory
         # hold by +obj+
         #
-        # This can be used to create a new object later by using value_type.wrap, where
-        # +value_type+ is the object returned by Registry#get. Example:
+        # @example marshalling and unmarshalling a value. {Type.from_buffer} can
+        #   create the value back from the marshalled data. If non-default
+        #   options are given to {#to_byte_array}, the same options must be used
+        #   in from_buffer.
         #
-        #   # Do complex computation
         #   marshalled_data = result.to_byte_array
-        #
-        #   # Later on ...
-        #   value = my_registry.get('/base/Type').wrap(marshalled_data)
+        #   value = my_registry.get('/base/Type').from_buffer(marshalled_data)
+        # 
+        # @option options [Boolean] accept_pointers (false) whether pointers, when
+        #   present, should cause an exception to be raised or simply
+        #   ignored
+        # @option options [Boolean] accept_opaques (false) whether opaques, when
+        #   present, should cause an exception to be raised or simply
+        #   ignored
+        # @option options [Boolean] merge_skip_copy (true) whether padding
+        #   bytes should be marshalled as well when adjacent to non-padding
+        #   bytes, to reduce CPU load at the expense of I/O. When set to
+        #   false, padding bytes are removed completely.
+        # @option options [Boolean] remove_trailing_skips (true) whether
+        #   padding bytes at the end of the value should be marshalled or
+        #   not.
         def to_byte_array(options = Hash.new)
+            apply_changes_from_converted_types
             options = Type.validate_layout_options(options)
             do_byte_array(
                 options[:accept_pointers],
@@ -453,10 +670,8 @@ module Typelib
                 options[:remove_trailing_skips])
         end
 
-
-	def initialize(*args)
-	    __initialize__(*args)
-	end
+        def typelib_initialize
+        end
 
         def freeze_children
         end
@@ -499,21 +714,59 @@ module Typelib
 	    elsif ! (ruby_value = to_ruby).eql?(self)
 		ruby_value.to_s
 	    else
-		"#<#{self.class.name}: 0x#{address.to_s(16)} ptr=0x#{@ptr.zone_address.to_s(16)}>"
+                raw_to_s
 	    end
 	end
+
+        def raw_to_s
+            "#<#{self.class.name}: 0x#{address.to_s(16)} ptr=0x#{@ptr.zone_address.to_s(16)}>"
+        end
 
 	def pretty_print(pp) # :nodoc:
 	    pp.text to_s
 	end
 
         # Get the memory pointer for self
+        #
+        # @return [MemoryZone]
         def to_memory_ptr; @ptr end
 
 	def is_a?(typename); self.class.is_a?(typename) end
 
         def inspect
             sprintf("#<%s:%s @%s>", self.class.superclass.name, self.class.name, to_memory_ptr.inspect)
+        end
+
+        # Returns a representation of this type only into simple Ruby values,
+        # that is strings, numbers and arrays / hashes.
+        #
+        # @option options [Boolean] :special_float_values () if :string, the
+        #   floating point special values NaN and Infinity are converted to
+        #   strings. If :nil, they are converted to nil. Otherwise, they are
+        #   left as-is. This is required for marshalling formats that can't
+        #   represent them.
+        # @option options [Boolean] :pack_simple_arrays (true) if true, arrays
+        #   and containers of numeric types will be packed into a hash of the form
+        #   {size: size_in_elements, pack_code: code, data: packed_data}. The
+        #   pack_code field describes the type of element in the array (from
+        #   String#unpack or Array#pack), which tells both the type of the data
+        #   and its endianness.
+        #
+        # @return [Object]
+        def to_simple_value(options = Hash.new)
+            raise NotImplementedError, "there is no way to convert a value of type #{self.class} into a simple ruby value"
+        end
+
+        # Returns a representation of this type that can be serialized with JSON
+        #
+        # This is calling to_simple_value with the :special_float_values option
+        # set to :nil by default, as JSON cannot represent NaN and Infinity and
+        # converting those to null is the behaviour specified in the JSON
+        # documentation.
+        # 
+        # (see Type#to_simple_value)
+        def to_json_value(options = Hash.new)
+            to_simple_value(Hash[:special_float_values => :nil].merge(options))
         end
     end
 end

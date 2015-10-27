@@ -9,15 +9,16 @@ require 'pp'
 require 'facets/string/camelcase'
 require 'set'
 require 'utilrb/value_set'
+require 'base64'
 
 if !defined?(Infinity)
-    Infinity = 1e200 ** 200
+    Infinity = Float::INFINITY
 end
 if !defined?(Inf)
-    Inf = Infinity
+    Inf = Float::INFINITY
 end
 if !defined?(NaN)
-    NaN = Infinity / Infinity
+    NaN = Float::NAN
 end
 
 # Typelib is the main module for Ruby-side Typelib functionality.
@@ -63,6 +64,8 @@ end
 module Typelib
     extend Logger::Root('Typelib', Logger::WARN)
 
+    TYPELIB_LIB_DIR = File.expand_path('typelib', File.dirname(__FILE__))
+
     class << self
 	# If true (the default), typelib will load its type plugins. Otherwise,
         # it will not
@@ -100,6 +103,11 @@ module Typelib
         ns
     end
 
+    class << self
+        attr_predicate :warn_about_helper_method_clashes?, true
+    end
+    @warn_about_helper_method_clashes = true
+
     def self.filter_methods_that_should_not_be_defined(on, reference_class, names, allowed_overloadings, msg_name, with_raw, &block)
         names.find_all do |n|
             candidates = [n, "#{n}="]
@@ -109,7 +117,7 @@ module Typelib
             candidates.all? do |method_name|
                 if !reference_class.method_defined?(method_name) || allowed_overloadings.include?(method_name)
                     true
-                else
+                elsif warn_about_helper_method_clashes?
                     msg_name ||= "instances of #{reference_class.name}"
                     Typelib.warn "NOT defining #{candidates.join(", ")} on #{msg_name} as it would overload a necessary method"
                     false
@@ -122,7 +130,7 @@ module Typelib
         if !reference_class.method_defined?(name) || allowed_overloadings.include?(name)
             on.send(:define_method, name, &block)
             true
-        else
+        elsif warn_about_helper_method_clashes?
             msg_name ||= "instances of #{reference_class.name}"
             Typelib.warn "NOT defining #{name} on #{msg_name} as it would overload a necessary method"
             false
@@ -163,6 +171,7 @@ require 'typelib/array_type'
 require 'typelib/compound_type'
 require 'typelib/enum_type'
 require 'typelib/container_type'
+require 'typelib/metadata'
 
 require 'typelib/registry'
 require 'typelib/cxx_registry'
@@ -210,6 +219,34 @@ module Typelib
         end
     end
 
+    # Exception raised when Typelib.from_ruby is called but the value cannot be
+    # converted to the requested type
+    class UnknownConversionRequested < ArgumentError
+        attr_reader :value, :type
+        def initialize(value, type)
+            @value, @type = value, type
+        end
+
+        def pretty_print(pp)
+            pp.text "conversion from #{value} of type #{value.class} to #{type} requested, but there are no known conversion that apply"
+        end
+    end
+
+    # Exception raised when Typelib.from_ruby encounters a value that has the
+    # same type name than the requested type, but the types differ
+    class ConversionToMismatchedType < UnknownConversionRequested
+        def pretty_print(pp)
+            pp.text "type mismatch when trying to convert #{value} to #{type}"
+            pp.breakable
+            pp.text "the value's definition is "
+            value.class.pretty_print(pp, true)
+            pp.breakable
+            pp.text "the target type's definition is "
+            type.pretty_print(pp, true)
+        end
+    end
+
+
     # Initializes +expected_type+ from +arg+, where +arg+ can either be a value
     # of expected_type, a value that can be casted into a value of
     # expected_type, or a Ruby value that can be converted into a value of
@@ -229,20 +266,20 @@ module Typelib
             converted = expected_type.from_ruby(arg)
         else
             if !(expected_type < NumericType) && !arg.kind_of?(expected_type)
-                reason =
-                    if arg.class.name != expected_type.name
-                        "types differ and there are not convertions from one to the other"
-                    else
-                        "the types have the same name but different definitions"
-                    end
-                raise ArgumentError, "cannot convert #{arg} to #{expected_type.name}: #{reason}"
+                if arg.class.name != expected_type.name
+                    raise UnknownConversionRequested.new(arg, expected_type), "types differ and there are not convertions from one to the other: #{arg.class.name} <-> #{expected_type.name}"
+                else
+                    raise ConversionToMismatchedType.new(arg, expected_type), "the types have the same name but different definitions: #{arg.class.name} <-> #{expected_type.name}"
+                end
             end
             converted = arg
         end
         if !(expected_type < NumericType) && !converted.kind_of?(expected_type)
-            raise InternalError, "invalid conversion of #{arg} to #{expected_type.name}"
+            raise RuntimeError, "invalid conversion of #{arg} to #{expected_type.name}"
         end
-
+        if !converted.eql?(arg)
+            converted.apply_changes_from_converted_types
+        end
         converted
     end
 
@@ -283,11 +320,37 @@ module Typelib
     end
 end
 
-if Typelib.with_dyncall?
-require 'typelib/dyncall'
-end
-
 if ENV['TYPELIB_USE_GCCXML'] != '0'
     require 'typelib/gccxml'
 end
 
+# Finally, set guard types on the root classes
+module Typelib
+    class Type
+        initialize_base_class
+    end
+    class NumericType
+        initialize_base_class
+    end
+    class EnumType
+        initialize_base_class
+    end
+    class CompoundType
+        initialize_base_class
+    end
+    class ContainerType
+        initialize_base_class
+    end
+    class ArrayType
+        initialize_base_class
+    end
+    class IndirectType
+        initialize_base_class
+    end
+    class OpaqueType
+        initialize_base_class
+    end
+    class PointerType
+        initialize_base_class
+    end
+end

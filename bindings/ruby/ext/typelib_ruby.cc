@@ -3,7 +3,7 @@
 #include <typelib/typevisitor.hh>
 #include <typelib/pluginmanager.hh>
 #include <typelib/importer.hh>
-#include <utilmm/configfile/configset.hh>
+#include <typelib/utilmm/configset.hh>
 
 using namespace Typelib;
 using utilmm::config_set;
@@ -31,28 +31,27 @@ static VALUE kernel_is_numeric(VALUE klass, VALUE object)
 }
 
 
-static VALUE typelib_with_dyncall(VALUE klass)
+
+static VALUE typelib_is_big_endian(VALUE mod)
 {
-    return
-#ifdef WITH_DYNCALL
-        Qtrue;
-#else
-        Qfalse;
+#if defined(BOOST_BIG_ENDIAN)
+    return Qtrue;
+#elif defined(BOOST_LITTLE_ENDIAN)
+    return Qfalse;
 #endif
 }
 
 extern "C" void Init_typelib_ruby()
 {
     mTypelib  = rb_define_module("Typelib");
-#ifdef WITH_DYNCALL
-    Typelib_init_functions();
-#endif
     Typelib_init_values();
     Typelib_init_strings();
     Typelib_init_registry();
     Typelib_init_memory();
+    Typelib_init_metadata();
     
-    rb_define_singleton_method(mTypelib, "with_dyncall?", RUBY_METHOD_FUNC(typelib_with_dyncall), 0);
+    rb_define_singleton_method(mTypelib, "big_endian?", RUBY_METHOD_FUNC(typelib_is_big_endian), 0);
+
     rb_define_singleton_method(rb_mKernel, "immediate?", RUBY_METHOD_FUNC(kernel_is_immediate), 1);
     rb_define_singleton_method(rb_mKernel, "numeric?", RUBY_METHOD_FUNC(kernel_is_numeric), 1);
 }

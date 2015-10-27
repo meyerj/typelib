@@ -1,13 +1,9 @@
-require 'set'
-require './test_config'
-require 'typelib'
-require 'test/unit'
-require BUILDDIR + '/ruby/libtest_ruby'
-require 'pp'
+require 'typelib/test'
 
-class TC_Value < Test::Unit::TestCase
+class TC_Value < Minitest::Test
     include Typelib
     def teardown
+        super
 	GC.start
     end
 
@@ -43,16 +39,55 @@ class TC_Value < Test::Unit::TestCase
 	assert_kind_of(String, str.to_ruby)
     end
 
-    def test_value_init
-        type = CXXRegistry.new.build("/int")
-	value = type.new
+    def test_wrapping_a_buffer_should_call_typelib_initialize
+        int_t = CXXRegistry.new.build("/int")
+        v = Typelib.from_ruby(2, int_t)
+        recorder = flexmock
+        recorder.should_receive(:initialized).once
+        int_t.class_eval do
+            define_method(:typelib_initialize) { recorder.initialized }
+        end
+        int_t.from_buffer(v.to_byte_array)
+    end
 
-	assert(ptr = value.instance_variable_get(:@ptr))
-	assert_equal(value.zone_address, ptr.zone_address)
+    def test_wrapping_a_memory_zone_should_call_typelib_initialize
+        int_t = CXXRegistry.new.build("/int")
+        v = Typelib.from_ruby(2, int_t)
+        flexmock(int_t).new_instances.should_receive(:typelib_initialize).once
+        int_t.wrap(v.to_memory_ptr)
+    end
+
+    def test_creating_a_new_value_should_call_typelib_initialize
+        int_t = CXXRegistry.new.build("/int")
+        recorder = flexmock
+        recorder.should_receive(:initialized).once
+        int_t.class_eval do
+            define_method(:typelib_initialize) { recorder.initialized }
+        end
+        int_t.new
+    end
+
+    def test_wrapping_a_buffer_should_not_call_initialize
+        int_t = CXXRegistry.new.build("/int")
+        v = Typelib.from_ruby(2, int_t)
+        flexmock(int_t).new_instances.should_receive(:initialize).never
+        int_t.wrap(v.to_byte_array)
+    end
+
+    def test_wrapping_a_memory_zone_should_not_call_initialize
+        int_t = CXXRegistry.new.build("/int")
+        v = Typelib.from_ruby(2, int_t)
+        flexmock(int_t).new_instances.should_receive(:initialize).never
+        int_t.wrap(v.to_memory_ptr)
+    end
+
+    def test_creating_a_new_value_should_call_initialize
+        int_t = CXXRegistry.new.build("/int")
+        flexmock(int_t).new_instances(:value_new).should_receive(:initialize).once
+        int_t.new
     end
 
     def test_wrap_argument_check
-        registry = make_registry
         type = CXXRegistry.new.build("/int")
 
         assert_raises(ArgumentError) { type.wrap(nil) }
@@ -83,7 +118,7 @@ class TC_Value < Test::Unit::TestCase
 	assert(! a1.eql?(a2))
 
 	a2.d = 50
-	assert_not_equal(a1, a2)
+	refute_equal(a1, a2)
 
 	assert_raises(ArgumentError) { a1 == v1 }
     end
@@ -98,7 +133,7 @@ class TC_Value < Test::Unit::TestCase
         assert_same v0, v0.cast(t0)
         v1 = v0.cast(t1)
 
-        assert_not_same v0, v1
+        refute_same v0, v1
         assert(t0 == t1)
 
         wrong_type = r1.get 'A'
@@ -153,7 +188,8 @@ class TC_Value < Test::Unit::TestCase
     def test_pretty_printing
         b = make_registry.get("/B").new
         b.zero!
-        assert_nothing_raised { PP.new(b, StringIO.new) }
+        # Should not raise
+        PP.new(b, StringIO.new)
     end
 
     def test_to_csv
@@ -260,14 +296,15 @@ class TC_Value < Test::Unit::TestCase
     end
 
     def test_nan_handling
-        registry = make_registry
-        lib = Library.open('libtest_ruby.so', registry)
-        wrapper = lib.find('generate_nand').
-            returns(nil).returns('double*')
-	assert_equal(1.0/0.0, wrapper.call);
-        wrapper = lib.find('generate_nanf').
-            returns(nil).returns('float*')
-	assert_equal(1.0/0.0, wrapper.call);
+        reg = Typelib::CXXRegistry.new
+
+        double_t = reg.get('/double')
+        nan_d = [Float::NAN].pack("d")
+        assert double_t.wrap(nan_d).to_ruby.nan?
+
+        float_t = reg.get('/float')
+        nan_f = [Float::NAN].pack("f")
+        assert float_t.wrap(nan_f).to_ruby.nan?
     end
 
     def test_convertion_to_from_ruby

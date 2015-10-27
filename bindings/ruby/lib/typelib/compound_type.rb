@@ -6,6 +6,9 @@ module Typelib
     class CompoundType < Type
         # Module used to extend frozen values
         module Freezer
+            def set(*args)
+                raise TypeError, "frozen object"
+            end
             def raw_set(*args)
                 raise TypeError, "frozen object"
             end
@@ -16,7 +19,16 @@ module Typelib
 
         # Module used to extend invalidated values
         module Invalidate
+            def set(*args)
+                raise TypeError, "invalidated object"
+            end
+            def get(*args)
+                raise TypeError, "invalidated object"
+            end
             def raw_get(*args)
+                raise TypeError, "invalidated object"
+            end
+            def raw_get_cached(*args)
                 raise TypeError, "invalidated object"
             end
             def raw_set(*args)
@@ -122,12 +134,11 @@ module Typelib
 	# * a hash, in which case it is a { field_name => field_value } hash
 	# * an array, in which case the fields are initialized in order
 	# Note that a compound should be either fully initialized or not initialized
-        def initialize(ptr)
+        def typelib_initialize
+            super
 	    # A hash in which we cache Type objects for each of the structure fields
 	    @fields = Hash.new
             @field_types = self.class.field_types
-
-            super(ptr)
         end
 
         def raw_each_field
@@ -143,6 +154,8 @@ module Typelib
         end
 
         @fields = []
+        @field_types = Hash.new
+        @field_metadata = Hash.new
         class << self
 	    # Check if this type can be used in place of +typename+
 	    # In case of compound types, we check that either self, or
@@ -236,13 +249,16 @@ module Typelib
 	    # which returns the field type
             def subclass_initialize
                 @field_types = Hash.new
-                @fields = get_fields.map! do |name, offset, type|
+                @fields = Array.new
+                @field_metadata = Hash.new
+                get_fields.each do |name, offset, type, metadata|
                     if name.respond_to?(:force_encoding)
                         name.force_encoding('ASCII')
                     end
                     field_types[name] = type
                     field_types[name.to_sym] = type
-                    [name, type]
+                    fields << [name, type]
+                    field_metadata[name] = metadata
                 end
 
                 converted_fields = []
@@ -265,17 +281,26 @@ module Typelib
 
                 super if defined? super
 
-                convert_from_ruby Hash do |value, expected_type|
-                    result = expected_type.new
-                    result.set_hash(value)
-                    result
+                if !convertions_from_ruby.has_key?(Hash)
+                    convert_from_ruby Hash do |value, expected_type|
+                        result = expected_type.new
+                        result.set_hash(value)
+                        result
+                    end
                 end
 
-                convert_from_ruby Array do |value, expected_type|
-                    result = expected_type.new
-                    result.set_array(value)
-                    result
+                if !convertions_from_ruby.has_key?(Array)
+                    convert_from_ruby Array do |value, expected_type|
+                        result = expected_type.new
+                        result.set_array(value)
+                        result
+                    end
                 end
+            end
+
+            # Returns true if this compound has no fields
+            def empty?
+                fields.empty?
             end
 
             # Returns the offset, in bytes, of the given field
@@ -291,9 +316,11 @@ module Typelib
             attr_reader :fields
             # A name => type map of the types of each fiel
             attr_reader :field_types
+            # A name => object mapping of the field metadata objects
+            attr_reader :field_metadata
 	    # Returns the type of +name+
             def [](name)
-                if result = @field_types[name]
+                if result = field_types[name]
                     result
                 else
                     raise ArgumentError, "#{name} is not a field of #{self.name}"
@@ -301,15 +328,55 @@ module Typelib
             end
             # True if the given field is defined
             def has_field?(name)
-                @field_types.has_key?(name)
+                field_types.has_key?(name)
             end
 	    # Iterates on all fields
             #
             # @yield [name,type] the fields of this compound
             # @return [void]
             def each_field
-		@fields.each { |field| yield(*field) } 
+                return enum_for(__method__) if !block_given?
+		fields.each { |field| yield(*field) } 
 	    end
+
+            # Returns the description of a type using only simple ruby objects
+            # (Hash, Array, Numeric and String).
+            # 
+            #    { 'name' => TypeName,
+            #      'class' => NameOfTypeClass, # CompoundType, ...
+            #       # The content of 'element' is controlled by the :recursive option
+            #      'fields' => [{ 'name' => FieldName,
+            #                     # the 'type' field is controlled by the
+            #                     # 'recursive' option
+            #                     'type' => FieldType,
+            #                     # 'offset' is present only if :layout_info is
+            #                     # true
+            #                     'offset' => FieldOffsetInBytes
+            #                   }],
+            #      'size' => SizeOfTypeInBytes # Only if :layout_info is true
+            #    }
+            #
+            # @option (see Type#to_h)
+            # @return (see Type#to_h)
+            def to_h(options = Hash.new)
+                fields = Array.new
+                if options[:recursive]
+                    each_field.map do |name, type|
+                        fields << Hash[name: name, type: type.to_h(options)]
+                    end
+                else
+                    each_field.map do |name, type|
+                        fields << Hash[name: name, type: type.to_h_minimal(options)]
+                    end
+                end
+
+                if options[:layout_info]
+                    fields.each do |field|
+                        field[:offset] = offset_of(field[:name])
+                    end
+                end
+                super.merge(fields: fields)
+            end
 
 	    def pretty_print_common(pp) # :nodoc:
                 pp.group(2, '{', '}') do
@@ -325,7 +392,12 @@ module Typelib
             def pretty_print(pp, verbose = false) # :nodoc:
 		super(pp)
 		pp.text ' '
-		pretty_print_common(pp) do |name, offset, type|
+		pretty_print_common(pp) do |name, offset, type, metadata|
+                    if doc = metadata.get('doc').first
+                        if pp_doc(pp, doc)
+                            pp.breakable
+                        end
+                    end
 		    pp.text name
                     if verbose
                         pp.text "[#{offset}] <"
@@ -333,7 +405,7 @@ module Typelib
                         pp.text " <"
                     end
 		    pp.nest(2) do
-                        type.pretty_print(pp)
+                        type.pretty_print(pp, false)
 		    end
 		    pp.text '>'
 		end
@@ -386,6 +458,10 @@ module Typelib
             @fields[name] ||= typelib_get_field(name, true)
         end
 
+        def raw_get_cached(name)
+            @fields[name]
+        end
+
         def raw_set_field(name, value)
             raw_set(name, value)
         end
@@ -430,5 +506,15 @@ module Typelib
 	rescue TypeError => e
 	    raise e, "#{e.message} for #{self.class.name}.#{name}", e.backtrace
 	end
+
+        # (see Type#to_simple_value)
+        #
+        # Compound types are returned as a hash from the field name (as a
+        # string) to the converted field value.
+        def to_simple_value(options = Hash.new)
+            result = Hash.new
+            raw_each_field { |name, v| result[name.to_s] = v.to_simple_value(options) }
+            result
+        end
     end
 end

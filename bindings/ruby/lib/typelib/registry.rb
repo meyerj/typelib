@@ -32,19 +32,54 @@ module Typelib
             copy
         end
 
+        # Generates the smallest new registry that allows to define a set of types
+        #
+        # @overload minimal(type_name, with_aliases = true)
+        #   @param [String] type_name the name of a type
+        #   @param [Boolean] with_aliases if true, aliases defined in self that
+        #     point to types ending up in the minimal registry will be copied
+        #   @return [Typelib::Registry] the registry that allows to define the
+        #     named type
+        #
+        # @overload minimal(auto_types, with_aliases = true)
+        #   @param [Typelib::Registry] auto_types a registry containing the
+        #     types that are not necessary in the result
+        #   @param [Boolean] with_aliases if true, aliases defined in self that
+        #     point to types ending up in the minimal registry will be copied
+        #   @return [Typelib::Registry] the registry that allows to define all
+        #     types of self that are not in auto_types. Note that it may contain
+        #     types that are in the auto_types registry, if they are needed to
+        #     define some other type
 	def minimal(type, with_aliases = true)
 	    do_minimal(type, with_aliases)
 	end
 
         # Creates a new registry by loading a typelib XML file
         #
-        # See also Registry#merge_xml
+        # @see Registry#merge_xml
         def self.from_xml(xml)
             reg = Typelib::Registry.new
             reg.merge_xml(xml)
             reg
         end
 
+        # Enumerate the types contained in this registry
+        #
+        # @overload each(prefix, :with_aliases => false)
+        #   Enumerates the types and not the aliases
+        #
+        #   @param [nil,String] prefix if non-nil, only types whose name is this prefix
+        #     will be enumerated
+        #   @yieldparam [Model<Typelib::Type>] type a type
+        #
+        # @overload each(prefix, :with_aliases => true)
+        #   Enumerates the types and the aliases
+        #
+        #   @param [nil,String] prefix if non-nil, only types whose name is this prefix
+        #     will be enumerated
+        #   @yieldparam [String] name the type name, it is different from type.name for
+        #     aliases
+        #   @yieldparam [Model<Typelib::Type>] type a type
         def each(filter = nil, options = Hash.new, &block)
             if filter.kind_of?(Hash)
                 filter, options = nil, filter
@@ -61,6 +96,11 @@ module Typelib
         end
         include Enumerable
 
+        # Tests for the presence of a type by its name
+        #
+        # @param [String] name the type name
+        # @return [Boolean] true if this registry contains a type named like
+        #   this
         def include?(name)
             includes?(name)
         end
@@ -72,8 +112,6 @@ module Typelib
             if !mod.respond_to?('find_exported_template')
                 mod.extend(TypeExportNamespace)
                 mod.registry = self
-                mod.instance_variable_set :@exported_types, Hash.new
-                mod.instance_variable_set :@exported_templates, Hash.new
             end
         end
 
@@ -297,13 +335,19 @@ module Typelib
         end
 
         module TypeExportNamespace
-            attr_accessor :registry
-            attr_reader :exported_types
-            attr_reader :exported_templates
+            attr_writer :registry
+            def registry
+                if @registry then @registry
+                elsif superclass.respond_to?(:registry)
+                    superclass.registry
+                end
+            end
+            attribute(:exported_types) { Hash.new }
+            attribute(:exported_templates) { Hash.new }
 
             def find_exported_template(template_basename, args, remaining)
                 if remaining.empty?
-                    return @exported_templates[[template_basename, args]]
+                    return exported_templates[[template_basename, args]]
                 end
 
                 head, *tail = remaining
@@ -357,7 +401,7 @@ module Typelib
                     arg
                 end
             end
-            exports = mod.instance_variable_get :@exported_templates
+            exports = mod.exported_templates
             exports[[template_basename, template_args]] = exported_type
         end
 
@@ -551,9 +595,12 @@ module Typelib
             # The compound fields, registered at each called of #method_missing
             # and #add. The new type is registered when #build is called.
             attr_reader :fields
+            # The compound size, as specified on object creation. If zero, it is
+            # automatically computed
+            attr_reader :size
 
-            def initialize(name, registry)
-                @name, @registry = name, registry
+            def initialize(name, registry, size = 0)
+                @name, @registry, @size = name, registry, size
                 @fields = []
             end
             
@@ -569,7 +616,7 @@ module Typelib
                     field_def[2] ||= current_offset
                     current_offset = field_def[2] + field_def[1].size
                 end
-                registry.do_create_compound(name, fields)
+                registry.do_create_compound(name, fields, size)
             end
 
             # Adds a new field
@@ -617,8 +664,8 @@ module Typelib
         #     c.field1 = "/another/Compound"
         #   end
         #
-        def create_compound(name)
-            recorder = CompoundBuilder.new(name, self)
+        def create_compound(name, size = 0)
+            recorder = CompoundBuilder.new(name, self, size)
             yield(recorder)
             recorder.build
         end
@@ -631,11 +678,11 @@ module Typelib
         #
         # @example create a new std::vector type
         #   registry.create_container "/std/vector", "/my/Container"
-        def create_container(container_type, element_type)
+        def create_container(container_type, element_type, size = 0)
             if element_type.respond_to?(:to_str)
                 element_type = build(element_type)
             end
-            return define_container(container_type.to_str, element_type)
+            return define_container(container_type.to_str, element_type, size)
         end
 
         # Creates a new array type on this registry
@@ -645,12 +692,12 @@ module Typelib
         # @param [Integer] size the array size
         #
         # @example create a new array of 10 elements
-        #   registry.create_container "/my/Container", 10
-        def create_array(base_type, size)
+        #   registry.create_array "/my/Container", 10
+        def create_array(base_type, element_count, size = 0)
             if base_type.respond_to?(:name)
                 base_type = base_type.name
             end
-            return build("#{base_type}[#{size}]")
+            return build("#{base_type}[#{element_count}]", size)
         end
 
         # Helper class to build new enumeration types
@@ -662,9 +709,11 @@ module Typelib
             # [Array<Array(String,Integer)>] the enumeration name-to-integer
             #   mapping. Values are added with #add
             attr_reader :symbols
+            # Size, in bytes. If zero, it is automatically computed
+            attr_reader :size
 
-            def initialize(name, registry)
-                @name, @registry = name, registry
+            def initialize(name, registry, size)
+                @name, @registry, @size = name, registry, size
                 @symbols = []
             end
             
@@ -680,7 +729,7 @@ module Typelib
                     sym_def[1] ||= current_value
                     current_value = sym_def[1] + 1
                 end
-                registry.do_create_enum(name, symbols)
+                registry.do_create_enum(name, symbols, size)
             end
 
             # Add a new symbol to this enum
@@ -724,10 +773,19 @@ module Typelib
         #     c.sym2
         #   end
         #
-        def create_enum(name)
-            recorder = EnumBuilder.new(name, self)
+        def create_enum(name, size = 0)
+            recorder = EnumBuilder.new(name, self, size)
             yield(recorder)
             recorder.build
+        end
+
+        # Add a type from a different registry to this one
+        #
+        # @param [Class<Typelib::Type>] the type to be added
+        # @return [void]
+        def add(type)
+            merge(type.registry.minimal(type.name))
+            nil
         end
     end
 end

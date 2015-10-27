@@ -5,7 +5,7 @@
 #include <typelib/exporter.hh>
 #include <typelib/registryiterator.hh>
 #include <lang/csupport/standard_types.hh>
-#include <utilmm/configfile/configset.hh>
+#include <typelib/utilmm/configset.hh>
 #include <set>
 
 using namespace Typelib;
@@ -122,10 +122,12 @@ VALUE registry_source_id_of(VALUE self, VALUE rbtype)
     return rb_str_new(it.getSource().c_str(), it.getSource().length());
 }
 
-/* call-seq:
- *   registry.reverse_depends(type) => types
+/* @overload registry.reverse_depends(type)
+ *   Returns an array of the types that depend on another type, including the type itself
  *
- * Returns the array of types that depend on +type+, including +type+ itself
+ *   @param [Class<Typelib::Type>] type the type whose reverse dependencies we want
+ *   @return [Array<Class<Typelib::Type>>] the types that depend on the given
+ *     type, recursively and including the type itself.
  */
 static
 VALUE registry_reverse_depends(VALUE self, VALUE rbtype)
@@ -154,11 +156,18 @@ VALUE registry_do_get(VALUE self, VALUE name)
 }
 
 static
-VALUE registry_do_build(VALUE self, VALUE name)
+VALUE registry_do_build(int argc, VALUE* argv, VALUE self)
 {
+    VALUE name = argv[0];
+    int size = 0;
+    if (argc == 0 || argc > 2)
+        rb_raise(rb_eArgError, "expected one or two arguments, got %i", argc);
+    else if (argc == 2)
+        size = NUM2INT(argv[1]);
+
     Registry& registry = rb2cxx::object<Registry>(self);
     try {
-        Type const* type = registry.build( StringValuePtr(name) );
+        Type const* type = registry.build( StringValuePtr(name), size );
         if (! type) 
             rb_raise(eNotFound, "cannot find %s in registry", StringValuePtr(name));
         return cxx2rb::type_wrap(*type, self);
@@ -331,12 +340,6 @@ VALUE registry_resize(VALUE self, VALUE new_sizes)
     }
 }
 
-/* call-seq:
- *  minimal(auto_types) => registry
- *
- * Returns the minimal registry needed to define all types that are in +self+
- * but not in +auto_types+
- */
 static
 VALUE registry_minimal(VALUE self, VALUE rb_auto, VALUE with_aliases)
 {
@@ -386,13 +389,21 @@ static void yield_types(VALUE self, bool with_aliases, RegistryIterator it, Regi
     }
 }
 
-/*
- * each_type(filter, false) { |type| ... }
- * each_type(filter, true)  { |name, type| ... }
+/* @overload each_type(prefix, false)
+ *   Enumerates the types and not the aliases
  *
- * Iterates on the types found in this registry. If include_alias is true, also
- * yield the aliased types. If +filter+ is not nil, only the types whose names
- * start with +filter+ will be yield
+ *   @param [nil,String] prefix if non-nil, only types whose name is this prefix
+ *     will be enumerated
+ *   @yieldparam [Model<Typelib::Type>] type a type
+ *
+ * @overload each_type(prefix, true)
+ *   Enumerates the types and the aliases
+ *
+ *   @param [nil,String] prefix if non-nil, only types whose name is this prefix
+ *     will be enumerated
+ *   @yieldparam [String] name the type name, it is different from type.name for
+ *     aliases
+ *   @yieldparam [Model<Typelib::Type>] type a type
  */
 static
 VALUE registry_each_type(VALUE self, VALUE filter_, VALUE with_aliases_)
@@ -511,7 +522,7 @@ static VALUE registry_available_container(VALUE registry_module)
 
 /*
  * call-seq:
- *  registry.define_container(kind, element_type) => new_type
+ *  registry.define_container(name, kind, element_type, size) => new_type
  *
  * Defines a new container instance with the given container kind and element
  * type. +element_type+ is a type object, i.e. a subclass of Type, that has to
@@ -521,7 +532,7 @@ static VALUE registry_available_container(VALUE registry_module)
  *
  * Moreover, the method raises NotFound if +kind+ is not a known container name.
  */
-static VALUE registry_define_container(VALUE registry, VALUE kind, VALUE element)
+static VALUE registry_define_container(VALUE registry, VALUE kind, VALUE element, VALUE _size)
 {
     Registry& reg = rb2cxx::object<Registry>(registry);
     Type const& element_type(rb2cxx::object<Type>(element));
@@ -531,6 +542,9 @@ static VALUE registry_define_container(VALUE registry, VALUE kind, VALUE element
 
     try {
         Container const& new_type = Container::createContainer(reg, StringValuePtr(kind), element_type);
+        size_t size = NUM2INT(_size);
+        if (size != 0)
+            reg.get_(new_type).setSize(size);
         return cxx2rb::type_wrap(new_type, registry);
     } catch(Typelib::UnknownContainer) {
         rb_raise(eNotFound, "%s is not a known container type", StringValuePtr(kind));
@@ -554,18 +568,18 @@ static VALUE registry_add_standard_cxx_types(VALUE klass, VALUE registry)
 
 /*
  * call-seq:
- *   registry.create_compound(name, field_defs)
+ *   registry.do_create_compound(name, field_defs, size)
  *
  * Creates a new compound type in which the fields are provided by +field_defs+
  */
-static VALUE registry_create_compound(VALUE registry, VALUE name, VALUE field_defs)
+static VALUE registry_create_compound(VALUE registry, VALUE name, VALUE field_defs, VALUE _size)
 {
     Registry& reg = rb2cxx::object<Registry>(registry);
 
     std::auto_ptr<Typelib::Compound> new_t(new Typelib::Compound(StringValuePtr(name)));
 
-    int size = RARRAY_LEN(field_defs);
-    for (int i = 0; i < size; ++i)
+    int field_count = RARRAY_LEN(field_defs);
+    for (int i = 0; i < field_count; ++i)
     {
         VALUE field = rb_ary_entry(field_defs, i);
 
@@ -577,26 +591,28 @@ static VALUE registry_create_compound(VALUE registry, VALUE name, VALUE field_de
     }
 
     Typelib::Compound* type = new_t.release();
+    size_t size = NUM2INT(_size);
+    if (size != 0)
+        type->setSize(size);
     try { reg.add(type, true, ""); }
-    catch(std::runtime_error e)
-    { rb_raise(rb_eArgError, "%s", e.what()); }
+    catch(std::runtime_error e) { rb_raise(rb_eArgError, "%s", e.what()); }
     return cxx2rb::type_wrap(*type, registry);
 }
 
 /*
  * call-seq:
- *   registry.create_enum(name, symbol_defs)
+ *   registry.create_enum(name, symbol_defs, size)
  *
  * Creates a new compound type in which the fields are provided by +field_defs+
  */
-static VALUE registry_create_enum(VALUE registry, VALUE name, VALUE symbol_defs)
+static VALUE registry_create_enum(VALUE registry, VALUE name, VALUE symbol_defs, VALUE _size)
 {
     Registry& reg = rb2cxx::object<Registry>(registry);
 
     std::auto_ptr<Typelib::Enum> new_t(new Typelib::Enum(StringValuePtr(name)));
 
-    int size = RARRAY_LEN(symbol_defs);
-    for (int i = 0; i < size; ++i)
+    int symbol_count = RARRAY_LEN(symbol_defs);
+    for (int i = 0; i < symbol_count; ++i)
     {
         VALUE sym = rb_ary_entry(symbol_defs, i);
 
@@ -607,9 +623,10 @@ static VALUE registry_create_enum(VALUE registry, VALUE name, VALUE symbol_defs)
     }
 
     Typelib::Enum* type = new_t.release();
+    size_t size = NUM2INT(_size);
+    if (size != 0) type->setSize(size);
     try { reg.add(type, true, ""); }
-    catch(std::runtime_error e)
-    { rb_raise(rb_eArgError, "%s", e.what()); }
+    catch(std::runtime_error e) { rb_raise(rb_eArgError, "%s", e.what()); }
     return cxx2rb::type_wrap(*type, registry);
 }
 
@@ -623,21 +640,23 @@ static VALUE registry_create_opaque(VALUE registry, VALUE _name, VALUE _size)
 {
     Registry& reg = rb2cxx::object<Registry>(registry);
     Typelib::Type* type = new Typelib::OpaqueType(StringValuePtr(_name), NUM2INT(_size));
-    reg.add(type, true, "");
+    try { reg.add(type, true, ""); }
+    catch(std::runtime_error e) { rb_raise(rb_eArgError, "%s", e.what()); }
     return cxx2rb::type_wrap(*type, registry);
 }
 
 /*
  * call-seq:
- *   registry.create_null(name, size)
+ *   registry.create_null(name)
  *
- * Creates a new null type with the given name and size
+ * Creates a new null type with the given name
  */
 static VALUE registry_create_null(VALUE registry, VALUE _name)
 {
     Registry& reg = rb2cxx::object<Registry>(registry);
     Typelib::Type* type = new Typelib::NullType(StringValuePtr(_name));
-    reg.add(type, true, "");
+    try { reg.add(type, true, ""); }
+    catch(std::runtime_error e) { rb_raise(rb_eArgError, "%s", e.what()); }
     return cxx2rb::type_wrap(*type, registry);
 }
 
@@ -649,7 +668,7 @@ void typelib_ruby::Typelib_init_registry()
     rb_define_alloc_func(cRegistry, registry_alloc);
     rb_define_method(cRegistry, "size", RUBY_METHOD_FUNC(registry_size), 0);
     rb_define_method(cRegistry, "get", RUBY_METHOD_FUNC(registry_do_get), 1);
-    rb_define_method(cRegistry, "build", RUBY_METHOD_FUNC(registry_do_build), 1);
+    rb_define_method(cRegistry, "build", RUBY_METHOD_FUNC(registry_do_build), -1);
     rb_define_method(cRegistry, "each_type", RUBY_METHOD_FUNC(registry_each_type), 2);
     // do_import is called by the Ruby-defined import, which formats the 
     // option hash (if there is one), and can detect the import type by extension
@@ -666,14 +685,14 @@ void typelib_ruby::Typelib_init_registry()
     rb_define_method(cRegistry, "reverse_depends", RUBY_METHOD_FUNC(registry_reverse_depends), 1);
     rb_define_method(cRegistry, "remove", RUBY_METHOD_FUNC(registry_remove), 1);
     rb_define_method(cRegistry, "source_id_of", RUBY_METHOD_FUNC(registry_source_id_of), 1);
-    rb_define_method(cRegistry, "do_create_compound", RUBY_METHOD_FUNC(registry_create_compound), 2);
-    rb_define_method(cRegistry, "do_create_enum", RUBY_METHOD_FUNC(registry_create_enum), 2);
+    rb_define_method(cRegistry, "do_create_compound", RUBY_METHOD_FUNC(registry_create_compound), 3);
+    rb_define_method(cRegistry, "do_create_enum", RUBY_METHOD_FUNC(registry_create_enum), 3);
     rb_define_method(cRegistry, "create_opaque", RUBY_METHOD_FUNC(registry_create_opaque), 2);
     rb_define_method(cRegistry, "create_null", RUBY_METHOD_FUNC(registry_create_null), 1);
 
     rb_define_singleton_method(cRegistry, "add_standard_cxx_types", RUBY_METHOD_FUNC(registry_add_standard_cxx_types), 1);
 
     rb_define_singleton_method(cRegistry, "available_containers", RUBY_METHOD_FUNC(registry_available_container), 0);
-    rb_define_method(cRegistry, "define_container", RUBY_METHOD_FUNC(registry_define_container), 2);
+    rb_define_method(cRegistry, "define_container", RUBY_METHOD_FUNC(registry_define_container), 3);
 }
 

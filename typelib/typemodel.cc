@@ -10,7 +10,6 @@
 
 #include <numeric>
 #include <algorithm>
-#include <cassert>
 using namespace std;
 
 #include <iostream>
@@ -22,9 +21,23 @@ namespace Typelib
     Type::Type(std::string const& name, size_t size, Category category)
         : m_size(size)
         , m_category(category)
-        { setName(name); }
+        , m_metadata(new MetaData)
+    {
+        setName(name);
+    }
 
-    Type::~Type() {}
+    Type::Type(Type const& type)
+        : m_name(type.m_name)
+        , m_size(type.m_size)
+        , m_category(type.m_category)
+        , m_metadata(new MetaData(*type.m_metadata))
+    {
+    }
+
+    Type::~Type()
+    {
+        delete m_metadata;
+    }
 
     std::string Type::getName() const { return m_name; }
     std::string Type::getBasename() const { return getTypename(m_name); }
@@ -102,12 +115,15 @@ namespace Typelib
 	Type const* old_type = registry.get(getName());
 	if (old_type)
 	{
-            if (old_type->isSame(*this))
+            if (old_type->do_compare(*this, true, stack))
+            {
+                stack.insert(make_pair(this, old_type));
 		return old_type;
+            }
 	    else
 		throw DefinitionMismatch(getName());
 	}
-        return 0;
+        return NULL;
     }
     Type const& Type::merge(Registry& registry, RecursionStack& stack) const
     {
@@ -149,6 +165,76 @@ namespace Typelib
             }
         }
         return false;
+    }
+
+    MetaData& Type::getMetaData() const
+    {
+        return *m_metadata;
+    }
+
+    MetaData::Values Type::getMetaData(std::string const& key) const
+    {
+        return m_metadata->get(key);
+    }
+
+    void Type::mergeMetaData(Type const& other) const
+    {
+        m_metadata->merge(other.getMetaData());
+    }
+
+    bool MetaData::include(std::string const& key) const
+    {
+        return m_values.find(key) != m_values.end();
+    }
+
+    MetaData::Map const& MetaData::get() const
+    {
+        return m_values;
+    }
+
+    MetaData::Values MetaData::get(std::string const& key) const
+    {
+        Map::const_iterator it = m_values.find(key);
+        if (it == m_values.end())
+            return Values();
+        return it->second;
+    }
+
+    void MetaData::set(std::string const& key, std::string const& value)
+    {
+        clear(key);
+        add(key, value);
+    }
+
+    void MetaData::add(std::string const& key, std::string const& value)
+    {
+        m_values[key].insert(value);
+    }
+
+    void MetaData::add(std::string const& key, Values const& values)
+    {
+        // This ensures that m_values[key] is at least initialized with an empty
+        // Values object
+        Values& key_values = m_values[key];
+        for (Values::const_iterator it = values.begin(); it != values.end(); ++it)
+            key_values.insert(*it);
+    }
+
+    void MetaData::clear(std::string const& key)
+    {
+        m_values.erase(key);
+    }
+
+    void MetaData::clear()
+    {
+        m_values.clear();
+    }
+
+    void MetaData::merge(MetaData const& metadata)
+    {
+        Map const& values = metadata.m_values;
+        for (Map::const_iterator it = values.begin(); it != values.end(); ++it)
+            m_values[it->first].insert(it->second.begin(), it->second.end());
     }
 
     bool OpaqueType::do_compare(Type const& other, bool equality, std::map<Type const*, Type const*>& stack) const
@@ -217,7 +303,7 @@ namespace Typelib
             if (it -> getName() == name)
                 return &(*it);
         }
-        return 0;
+        return NULL;
     }
     unsigned int Compound::getTrailingPadding() const
     {
@@ -249,8 +335,7 @@ namespace Typelib
 
         FieldList::const_iterator left_it = m_fields.begin(),
             left_end = m_fields.end(),
-            right_it = right_type.getFields().begin(),
-            right_end = right_type.getFields().end();
+            right_it = right_type.getFields().begin();
 
         while (left_it != left_end)
         {
@@ -266,9 +351,9 @@ namespace Typelib
         return true;
     }
 
-    void Compound::addField(const std::string& name, Type const& type, size_t offset) 
-    { addField( Field(name, type), offset ); }
-    void Compound::addField(Field const& field, size_t offset)
+    Field const& Compound::addField(const std::string& name, Type const& type, size_t offset) 
+    { return addField( Field(name, type), offset ); }
+    Field const& Compound::addField(Field const& field, size_t offset)
     {
         m_fields.push_back(field);
         m_fields.back().setOffset(offset);
@@ -276,18 +361,19 @@ namespace Typelib
 	size_t new_size = offset + field.getType().getSize();
 	if (old_size < new_size)
 	    setSize(new_size);
+        return m_fields.back();
     }
     Type* Compound::do_merge(Registry& registry, RecursionStack& stack) const
     {
 	auto_ptr<Compound> result(new Compound(getName()));
-        RecursionStack::iterator it = stack.insert(make_pair(this, result.get())).first;
+        RecursionStack::iterator onStackIter = stack.insert(make_pair(this, result.get())).first;
 
         try  {
             for (FieldList::const_iterator it = m_fields.begin(); it != m_fields.end(); ++it)
                 result->addField(it->getName(), it->getType().merge(registry, stack), it->getOffset());
         }
         catch(...) {
-            stack.erase(it);
+            stack.erase(onStackIter);
             throw;
         }
 
@@ -324,6 +410,20 @@ namespace Typelib
         return false;
     }
 
+    void Compound::mergeMetaData(Type const& other) const
+    {
+        Type::mergeMetaData(other);
+        Compound const* other_compound = dynamic_cast<Compound const*>(&other);
+        if (other_compound)
+        {
+            for (FieldList::const_iterator it = m_fields.begin(); it != m_fields.end(); ++it)
+            {
+                Field const* other_field = other_compound->getField(it->getName());
+                if (other_field)
+                    it->mergeMetaData(*other_field);
+            }
+        }
+    }
 
     Enum::AlreadyExists::AlreadyExists(Type const& type, std::string const& name)
         : std::runtime_error("enumeration symbol " + name + " is already used in " + type.getName()) {}
@@ -468,19 +568,14 @@ namespace Typelib
 
     std::string Container::kind() const { return m_kind; }
 
-    Container::AvailableContainers* Container::s_available_containers;
-    Container::AvailableContainers Container::availableContainers() {
-        if (!s_available_containers)
-            return Container::AvailableContainers();
-        return *s_available_containers;
+    Container::AvailableContainers Container::s_available_containers;
+    const Container::AvailableContainers& Container::availableContainers() {
+        return s_available_containers;
     }
 
     void Container::registerContainer(std::string const& name, ContainerFactory factory)
     {
-        if (s_available_containers == 0)
-            s_available_containers = new Container::AvailableContainers;
-
-        (*s_available_containers)[name] = factory;
+        s_available_containers[name] = factory;
     }
     Container const& Container::createContainer(Registry& r, std::string const& name, Type const& on)
     {
@@ -490,8 +585,8 @@ namespace Typelib
     }
     Container const& Container::createContainer(Registry& r, std::string const& name, std::list<Type const*> const& on)
     {
-        AvailableContainers::const_iterator it = s_available_containers->find(name);
-        if (it == s_available_containers->end())
+        AvailableContainers::const_iterator it = s_available_containers.find(name);
+        if (it == s_available_containers.end())
             throw UnknownContainer(name);
         return (*it->second)(r, on);
     }
@@ -524,7 +619,18 @@ namespace Typelib
     { throw std::logic_error("trying to use getElement on a container that is not random-access"); }
 
     Field::Field(const std::string& name, const Type& type)
-        : m_name(name), m_type(type), m_offset(0) {}
+        : m_name(name), m_type(type), m_offset(0), m_metadata(new MetaData) {}
+    Field::~Field()
+    {
+        delete m_metadata;
+    }
+    Field::Field(Field const& field)
+        : m_name(field.m_name)
+        , m_type(field.m_type)
+        , m_offset(field.m_offset)
+        , m_metadata(new MetaData(*field.m_metadata))
+    {
+    }
 
     std::string Field::getName() const { return m_name; }
     Type const& Field::getType() const { return m_type; }
@@ -532,12 +638,20 @@ namespace Typelib
     void    Field::setOffset(size_t offset) { m_offset = offset; }
     bool Field::operator == (Field const& field) const
     { return m_offset == field.m_offset && m_name == field.m_name && m_type.isSame(field.m_type); }
+    MetaData& Field::getMetaData() const
+    { return *m_metadata; }
+    MetaData::Values Field::getMetaData(std::string const& key) const
+    { return m_metadata->get(key); }
+    void Field::mergeMetaData(Field const& field) const
+    { return m_metadata->merge(field.getMetaData()); }
 
 
-    BadCategory::BadCategory(Type::Category found, int expected)
+    BadCategory::BadCategory(Type::Category found, Type::Category expected)
         : TypeException("bad category: found " + lexical_cast<string>(found) + " expecting " + lexical_cast<string>(expected))
         , found(found), expected(expected) {}
     NullTypeFound::NullTypeFound()
         : TypeException("null type found") { }
+    NullTypeFound::NullTypeFound(Type const& type)
+        : TypeException("null type " + type.getName() + " found") { }
 };
 

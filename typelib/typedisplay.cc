@@ -67,6 +67,8 @@ bool TypeDisplayVisitor::visit_(Numeric const& type)
     case Numeric::Float:
         name = "float";
         break;
+    default:
+        throw UnsupportedType(type, "unsupported numeric category");
     };
 
     m_stream
@@ -77,6 +79,11 @@ bool TypeDisplayVisitor::visit_(Numeric const& type)
 bool TypeDisplayVisitor::visit_(Enum const& type)
 {
     m_stream << "enum " << type.getName();
+    Enum::ValueMap::const_iterator it;
+
+    for (it = type.values().begin(); it != type.values().end(); ++it)
+	m_stream << "\n    " << it->first << " -> " << it->second;
+
     return true;
 }
 

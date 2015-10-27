@@ -1,11 +1,6 @@
 #include "typelib.hh"
 #include <typelib/value_ops.hh>
 #include <ruby.h>
-#if !defined(RUBY_19) && !defined(RUBY_191)
-extern "C" {
-#include <st.h>
-}
-#endif
 
 using namespace Typelib;
 using namespace std;
@@ -28,10 +23,6 @@ static int memory_table_compare(void* a, void* b)
     return (a != b);
 }
 
-#if !defined(RUBY_19) && !defined(RUBY_191)
-typedef long st_index_t;
-#endif
-
 static st_index_t memory_table_hash(void* a)
 {
     /* Use the low-order bits as hash value, as they are the most likely to
@@ -39,22 +30,10 @@ static st_index_t memory_table_hash(void* a)
     return (st_index_t)a;
 }
 
-#if defined(RUBY_19)
 static struct st_hash_type memory_table_type = {
     (int (*)(...))memory_table_compare,
     (st_index_t (*)(...))memory_table_hash
 };
-#elif defined(RUBY_191)
-static struct st_hash_type memory_table_type = {
-    (int (*)(...))memory_table_compare,
-    (int (*)(...))memory_table_hash
-};
-#else
-static struct st_hash_type memory_table_type = {
-    (int (*)())memory_table_compare,
-    (int (*)())memory_table_hash
-};
-#endif
 
 struct MemoryTableEntry
 {
@@ -90,6 +69,7 @@ typedef std::map< void const*, RbMemoryLayout > TypeLayouts;
 MemoryTypes memory_types;
 TypeLayouts memory_layouts;
 
+#ifdef VERBOSE
 static int
 memory_touch_i(volatile void* ptr, MemoryTableEntry* entry, st_data_t)
 {
@@ -105,6 +85,7 @@ memory_touch_all()
     st_foreach(MemoryTable, (int(*)(ANYARGS))memory_touch_i, (st_data_t)0);
 
 }
+#endif
 
 bool
 typelib_ruby::memory_ref(void *ptr)
@@ -131,6 +112,7 @@ memory_zone_unref(MemoryZone* ptr)
     // ptr->ptr is NULL if the zone has been invalidated
     if (ptr->ptr)
         memory_unref(ptr->ptr);
+    delete ptr;
 }
 
 void
@@ -144,19 +126,19 @@ typelib_ruby::memory_unref(void *ptr)
     if (!st_lookup(MemoryTable, (st_data_t)ptr, (st_data_t*)&entry))
         rb_raise(rb_eArgError, "cannot find %p in memory table", ptr);
     --(entry->refcount);
-    if (!entry->refcount)
-    {
-        if (entry->owned)
-            memory_delete(ptr);
-        if (entry->root_ptr)
-            memory_unref(entry->root_ptr);
+    if (entry->refcount)
+        return;
 
-#       ifdef VERBOSE
-        fprintf(stderr, "%p: deregister\n", ptr);
-#       endif
-        delete entry;
-        st_delete(MemoryTable, (st_data_t*)&ptr, 0);
-    }
+    if (entry->owned)
+        memory_delete(ptr);
+    if (entry->root_ptr)
+        memory_unref(entry->root_ptr);
+
+#   ifdef VERBOSE
+    fprintf(stderr, "%p: deregister\n", ptr);
+#   endif
+    delete entry;
+    st_delete(MemoryTable, (st_data_t*)&ptr, 0);
 
     MemoryTypes::iterator type_it = memory_types.find(ptr);
     if (type_it != memory_types.end())

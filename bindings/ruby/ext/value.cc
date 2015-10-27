@@ -31,7 +31,7 @@ void* value_root_ptr(VALUE value)
         Value v = rb2cxx::object<Value>(parent);
         return v.getData();
     }
-    else return 0;
+    else return NULL;
 }
 
 /* There are constraints when creating a Ruby wrapper for a Type, mainly
@@ -59,6 +59,7 @@ VALUE cxx2rb::value_wrap(Value v, VALUE registry, VALUE parent)
     VALUE wrapper = rb_funcall(type, rb_intern("wrap"), 1, ptr);
 
     rb_iv_set(wrapper, "@parent", parent);
+    rb_iv_set(wrapper, "@__typelib_invalidated", Qfalse);
     return wrapper;
 }
 
@@ -121,6 +122,7 @@ VALUE cxx2rb::type_wrap(Type const& type, VALUE registry)
     rb_iv_set(klass, "@name", rb_str_new2(type.getName().c_str()));
     rb_iv_set(klass, "@null", (type.getCategory() == Type::NullType) ? Qtrue : Qfalse);
     rb_iv_set(klass, "@opaque", (type.getCategory() == Type::Opaque) ? Qtrue : Qfalse);
+    rb_iv_set(klass, "@metadata", cxx2rb::metadata_wrap(type.getMetaData()));
 
     if (rb_respond_to(klass, rb_intern("subclass_initialize")))
 	rb_funcall(klass, rb_intern("subclass_initialize"), 0);
@@ -133,9 +135,7 @@ VALUE cxx2rb::type_wrap(Type const& type, VALUE registry)
  * Typelib::Type
  */
 
-/** 
- * call-seq:
- *   type.to_csv([basename [, separator]])	    => string
+/* @overload type.to_csv([basename [, separator]])
  *
  * Returns a one-line representation of this type, using +separator+ 
  * to separate each fields. If +basename+ is given, use it as a 
@@ -166,11 +166,12 @@ static VALUE type_to_csv(int argc, VALUE* argv, VALUE rbself)
     return rb_str_new(str.c_str(), str.length());
 }
 
-/* call-seq:
- *  t.basename => name
+/* @overload t.basename
  *
  * Returns the type name of the receiver with the namespace part
  * removed
+ *
+ * @return [String]
  */
 static VALUE typelib_do_basename(VALUE mod, VALUE name)
 {
@@ -185,7 +186,12 @@ static VALUE typelib_do_namespace(VALUE mod, VALUE name)
     return rb_str_new(result.c_str(), result.length());
 }
 
-/* Internal helper method for Type#namespace */
+/* @overload split_typename
+ *
+ * Splits the typename of self into its components
+ * 
+ * @return [Array<String>]
+ */
 static VALUE typelib_do_split_name(VALUE mod, VALUE name)
 {
     std::list<std::string> splitted = Typelib::splitTypename(StringValuePtr(name));
@@ -196,19 +202,20 @@ static VALUE typelib_do_split_name(VALUE mod, VALUE name)
 }
 
 
-/* call-seq:
- *  t1 == t2 => true or false
+/* @overload t1 == t2
  *
  * Returns true if +t1+ and +t2+ are the same type definition.
+ *
+ * @return [Boolean]
  */
 static VALUE type_equal_operator(VALUE rbself, VALUE rbwith)
 { 
-    if (! rb_respond_to(rbwith, rb_intern("superclass")))
-	return Qfalse;
-    if (rb_funcall(rbself, rb_intern("superclass"), 0) != rb_funcall(rbwith, rb_intern("superclass"), 0))
-        return Qfalse;
     if (rbself == rbwith)
         return Qtrue;
+    if (!rb_obj_is_kind_of(rbwith, rb_cClass))
+        return Qfalse;
+    if ((rbwith == cType) || !RTEST(rb_funcall(rbwith, rb_intern("<"), 1, cType)))
+	return Qfalse;
 
     Type const& self(rb2cxx::object<Type>(rbself));
     Type const& with(rb2cxx::object<Type>(rbwith));
@@ -216,8 +223,7 @@ static VALUE type_equal_operator(VALUE rbself, VALUE rbwith)
     return result ? Qtrue : Qfalse;
 }
 
-/* call-seq:
- *  type.size	=> size
+/* @overload type.size
  *
  * Returns the size in bytes of instances of +type+
  */
@@ -227,10 +233,7 @@ static VALUE type_size(VALUE self)
     return INT2FIX(type.getSize());
 }
 
-/* call-seq:
- *  type.dependencies => set_of_type
- *
- * Returns the set of Type subclasses that represent the types needed to build
+/* Returns the set of Type subclasses that represent the types needed to build
  * +type+.
  */
 static VALUE type_dependencies(VALUE self)
@@ -247,8 +250,7 @@ static VALUE type_dependencies(VALUE self)
     return result;
 }
 
-/* call-seq:
- *  type.casts_to?(other_type) => true or false
+/* @overload type.casts_to?(other_type) => true or false
  *
  * Returns true if a value that is described by +type+ can be manipulated using
  * +other_type+. This is a weak form of equality
@@ -319,23 +321,6 @@ static VALUE type_memory_layout(VALUE self, VALUE pointers, VALUE opaques, VALUE
     return result;
 }
 
-/* PODs are assignable, pointers are dereferenced */
-static VALUE type_is_assignable(Type const& type)
-{
-    switch(type.getCategory())
-    {
-    case Type::Numeric:
-        return INT2FIX(1);
-    case Type::Pointer:
-        return type_is_assignable( dynamic_cast<Pointer const&>(type).getIndirection());
-    case Type::Enum:
-        return INT2FIX(1);
-    default:
-        return INT2FIX(0);
-    }
-    // never reached
-}
-
 VALUE typelib_ruby::type_get_registry(VALUE self)
 {
     return rb_iv_get(self, "@registry");
@@ -353,40 +338,106 @@ static void value_delete(void* self) { delete reinterpret_cast<Value*>(self); }
 static VALUE value_alloc(VALUE klass)
 { return Data_Wrap_Struct(klass, 0, value_delete, new Value); }
 
+/** Allocates a new Typelib object, which wraps an untyped, unallocated Value
+ * object
+ */
 static
-VALUE value_initialize(VALUE self, VALUE ptr)
+VALUE value_create_empty(VALUE klass)
 {
-    Type const& t(rb2cxx::object<Type>(rb_class_of(self)));
-
-    if (NIL_P(ptr) || rb_obj_is_kind_of(ptr, rb_cString))
-    {
-#       ifdef VERBOSE
-        fprintf(stderr, "allocating new value of type %s to copy an existing buffer\n", t.getName().c_str());
-#       endif
-        VALUE buffer = memory_allocate(t.getSize());
-        memory_init(buffer, rb_class_of(self));
-	if (! NIL_P(ptr))
-	{
-            char* ruby_buffer = StringValuePtr(ptr);
-            vector<uint8_t> cxx_buffer(ruby_buffer, ruby_buffer + RSTRING_LEN(ptr));
-            try { Typelib::load(Value(memory_cptr(buffer), t), cxx_buffer); }
-            catch(std::exception const& e)
-            { rb_raise(rb_eArgError, "%s", e.what()); }
-	}
-
-	ptr = buffer;
-    }
-
-    // Protect 'ptr' against the GC
-    rb_iv_set(self, "@ptr", ptr);
-    Value& value  = rb2cxx::object<Value>(self);
-    value = Value(memory_cptr(ptr), t);
-#   ifdef VERBOSE
-    fprintf(stderr, "object %llu uses memory zone %p\n", NUM2ULL(rb_obj_id(self)), value.getData());
-#   endif
-    return self;
+    Type const& t(rb2cxx::object<Type>(klass));
+    VALUE value = Data_Wrap_Struct(klass, 0, value_delete, new Value(NULL, t));
+    rb_iv_set(value, "@parent", Qnil);
+    return value;
 }
 
+static
+void value_call_typelib_initialize(VALUE obj)
+{
+    rb_iv_set(obj, "@__typelib_invalidated", Qfalse);
+    rb_iv_set(obj, "@parent", Qnil);
+    rb_funcall(obj, rb_intern("typelib_initialize"), 0);
+}
+
+/* @overload from_memory_zone(ptr)
+ *
+ * @param [Typelib::MemoryZone] ptr
+ * @return [Typelib::Type]
+ *
+ * Allocates a new Typelib object that uses a given MemoryZone object
+ */
+static
+VALUE value_from_memory_zone(VALUE klass, VALUE ptr)
+{
+    VALUE result = value_create_empty(klass);
+    Value& value  = rb2cxx::object<Value>(result);
+    
+    // Protect the memory zone against GC until we don't need it anymore
+    rb_iv_set(result, "@ptr", ptr);
+    value = Value(memory_cptr(ptr), value.getType());
+#   ifdef VERBOSE
+    fprintf(stderr, "object %llu wraps memory zone %p\n", NUM2ULL(rb_obj_id(result)), value.getData());
+#   endif
+    value_call_typelib_initialize(result);
+    return result;
+}
+
+/* @overload new
+ *
+ * @return [Typelib::Type]
+ *
+ * Allocates a new Typelib object that has a freshly initialized buffer inside
+ */
+static
+VALUE value_new(VALUE klass)
+{
+    Type const& type(rb2cxx::object<Type>(klass));
+#   ifdef VERBOSE
+    fprintf(stderr, "allocating new value of type %s\n", type.getName().c_str());
+#   endif
+    VALUE buffer = memory_allocate(type.getSize());
+    memory_init(buffer, klass);
+
+    return value_from_memory_zone(klass, buffer);
+}
+
+static
+VALUE value_do_from_buffer(VALUE rbself, VALUE string, VALUE pointers, VALUE opaques, VALUE merge, VALUE remove_trailing_skips)
+{
+    Value value  = rb2cxx::object<Value>(rbself);
+
+    MemoryLayout layout = Typelib::layout_of(value.getType(),
+            RTEST(pointers), RTEST(opaques), RTEST(merge), RTEST(remove_trailing_skips));
+
+    char* ruby_buffer = StringValuePtr(string);
+    vector<uint8_t> cxx_buffer(ruby_buffer, ruby_buffer + RSTRING_LEN(string));
+    try { Typelib::load(value, cxx_buffer, layout); }
+    catch(std::exception const& e)
+    { rb_raise(rb_eArgError, "%s", e.what()); }
+    return rbself;
+}
+
+/* @overload from_address(address)
+ *
+ * Creates a value that wraps a given memory address
+ *
+ * @param [Integer] address
+ * @return [Typelib::Type]
+ */
+static
+VALUE value_from_address(VALUE klass, VALUE address)
+{
+    VALUE result = value_create_empty(klass);
+    Value& value  = rb2cxx::object<Value>(result);
+    value = Value(reinterpret_cast<void*>(NUM2ULL(address)), value.getType());
+    rb_iv_set(result, "@ptr", memory_wrap(value.getData(), false, NULL));
+    value_call_typelib_initialize(result);
+    return result;
+}
+
+/* @overload address
+ *
+ * @return [Integer] returns the address of the memory zone this value wraps
+ */
 static
 VALUE value_address(VALUE self)
 {
@@ -394,6 +445,13 @@ VALUE value_address(VALUE self)
     return LONG2NUM((long)value.getData());
 }
 
+/* @overload endian_swap
+ *
+ * Creates a new value with an endianness opposite of the one of self
+ *
+ * @return [Typelib::Type] a new value whose endianness has been swapped
+ * @see endian_swap!
+ */
 static
 VALUE value_endian_swap(VALUE self)
 {
@@ -407,6 +465,13 @@ VALUE value_endian_swap(VALUE self)
     return result;
 }
 
+/* @overload endian_swap!
+ *
+ * Swaps the endianness of self
+ *
+ * @return [Typelib::Type] self
+ * @see endian_swap
+ */
 static
 VALUE value_endian_swap_b(VALUE self, VALUE rb_compile)
 {
@@ -579,7 +644,11 @@ void typelib_ruby::Typelib_init_values()
     rb_define_singleton_method(cType, "do_memory_layout", RUBY_METHOD_FUNC(&type_memory_layout), 4);
     rb_define_singleton_method(cType, "do_dependencies",  RUBY_METHOD_FUNC(&type_dependencies), 0);
     rb_define_singleton_method(cType, "casts_to?",     RUBY_METHOD_FUNC(&type_can_cast_to), 1);
-    rb_define_method(cType, "__initialize__",   RUBY_METHOD_FUNC(&value_initialize), 1);
+    rb_define_singleton_method(cType, "value_new", RUBY_METHOD_FUNC(&value_new), 0);
+    rb_define_singleton_method(cType, "from_memory_zone", RUBY_METHOD_FUNC(&value_from_memory_zone), 1);
+    rb_define_singleton_method(cType, "from_address", RUBY_METHOD_FUNC(&value_from_address), 1);
+
+    rb_define_method(cType, "do_from_buffer", RUBY_METHOD_FUNC(&value_do_from_buffer), 5);
     rb_define_method(cType, "zero!",      RUBY_METHOD_FUNC(&value_zero), 0);
     rb_define_method(cType, "memory_eql?",      RUBY_METHOD_FUNC(&value_memory_eql_p), 1);
     rb_define_method(cType, "endian_swap",      RUBY_METHOD_FUNC(&value_endian_swap), 0);

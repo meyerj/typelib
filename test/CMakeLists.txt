@@ -4,11 +4,6 @@ set_source_files_properties(test_containers.cc PROPERTIES
     COMPILE_FLAGS -fno-strict-aliasing)
 
 CONFIGURE_FILE(testsuite.hh.in ${CMAKE_BINARY_DIR}/test/testsuite.hh @ONLY)
-INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/../lang/cimport ${CMAKE_CURRENT_BINARY_DIR}/../lang/cimport)
-if (ENABLE_INTERNAL_CPARSER)
-    set(TEST_LANG_C test_lang_c.cc)
-    add_definitions(-DHAS_INTERNAL_CPARSER)
-endif()
 ADD_EXECUTABLE(typelib_testsuite testsuite.cc
     test_registry.cc
     test_display.cc test_lang_tlb.cc test_model.cc
@@ -20,5 +15,11 @@ if (ENABLE_INTERNAL_CPARSER)
     TARGET_LINK_LIBRARIES(typelib_testsuite typeLang_c)
 endif()
 
-ADD_TEST(CxxSuite ${CMAKE_CURRENT_BINARY_DIR}/typelib_testsuite --catch_system_errors=no)
-
+ADD_TEST(CxxSuiteInstalledPlugins ${CMAKE_CURRENT_BINARY_DIR}/typelib_testsuite)
+ADD_TEST(CxxSuiteLocalPlugins ${CMAKE_CURRENT_BINARY_DIR}/typelib_testsuite)
+# the pluginmanager can load plugins from a list of paths set in the
+# environment. for testing we don't want to use the plugins in the
+# install-folder, but the freshly compiled ones in the build-folder. note that
+# the folders set in the env-var are hardcoded...
+set_property(TEST CxxSuiteLocalPlugins APPEND PROPERTY ENVIRONMENT
+    "TYPELIB_PLUGIN_PATH=${CMAKE_BINARY_DIR}/lang/csupport:${CMAKE_BINARY_DIR}/lang/tlb:${CMAKE_BINARY_DIR}/lang/idl")

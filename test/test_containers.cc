@@ -2,8 +2,7 @@
 #include <vector>
 
 #include <test/testsuite.hh>
-#include <utilmm/configfile/configset.hh>
-#include <utilmm/stringtools.hh>
+#include <typelib/utilmm/configset.hh>
 #include <typelib/pluginmanager.hh>
 #include <typelib/importer.hh>
 #include <typelib/typemodel.hh>
@@ -14,8 +13,6 @@
 #include <string.h>
 using namespace Typelib;
 using namespace std;
-using utilmm::split;
-using utilmm::join;
 
 template<int ptrsize> struct ptr_value_getter { };
 template<> struct ptr_value_getter<4> { typedef uint32_t result; };
@@ -55,7 +52,7 @@ BOOST_AUTO_TEST_CASE( test_vector_assumptions )
         ptr_value_t vector_min = ptr_value(&values);
         ptr_value_t vector_max = ptr_value(&values) + sizeof(values);
 
-        while ((it_p + sizeof(void*)) - values_p < sizeof(values))
+        while ((it_p + sizeof(void*)) - values_p < static_cast<int>(sizeof(values)))
         {
             ptr_value_t p = *reinterpret_cast<ptr_value_t*>(it_p);
             BOOST_REQUIRE(!(p >= vector_min && p < vector_max));

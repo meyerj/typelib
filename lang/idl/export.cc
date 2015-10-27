@@ -1,16 +1,37 @@
 #include "export.hh"
 #include <iostream>
-#include <utilmm/stringtools.hh>
 
 #include <typelib/typevisitor.hh>
 #include <typelib/plugins.hh>
 
-#include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/join.hpp>
+#include <boost/algorithm/string/split.hpp>
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/replace.hpp>
 
 namespace
 {
     using namespace std;
     using namespace Typelib;
+    using boost::split;
+    using boost::join;
+    using boost::is_any_of;
+
+    static list<string> nameSplit(std::string const& name)
+    {
+        list<string> separators;
+        split(separators, name, is_any_of("/"), boost::token_compress_on);
+        while(!separators.empty() && separators.front().empty())
+            separators.pop_front();
+        while(!separators.empty() && separators.back().empty())
+            separators.pop_back();
+        return separators;
+    }
+
+    static size_t namespaceIndentLevel(std::string const& ns)
+    {
+        return nameSplit(ns).size();
+    }
 
     static string normalizeIDLName(std::string const& name)
     {
@@ -65,18 +86,6 @@ namespace
             m_front = normalizeIDLName(m_front);
         }
     };
-
-    static bool isIDLBuiltinType(Type const& type)
-    {
-        if (type.getCategory() == Type::Numeric || type.getName() == "/std/string")
-            return true;
-        else if (type.getCategory() == Type::Array)
-        {
-            Type const& element_type = static_cast<Array const&>(type).getIndirection();
-            return isIDLBuiltinType(element_type);
-        }
-        return false;
-    }
 
     /** Returns the IDL identifier for the given type, without the type's own
      * namespace prepended
@@ -148,7 +157,7 @@ namespace
         return true;
     }
     bool IDLTypeIdentifierVisitor::visit_(NullType const& type)
-    { throw UnsupportedType(type, "null types are not supported for export in IDL"); }
+    { throw UnsupportedType(type, "null types are not supported for export in IDL, found " + type.getName()); }
     bool IDLTypeIdentifierVisitor::visit_(Container const& type)
     {
         if (type.getName() == "/std/string")
@@ -248,7 +257,7 @@ namespace
         std::string getTargetNamespace() const { return m_namespace; }
         void setTargetNamespace(std::string const& target_namespace)
         {
-            size_t ns_size = utilmm::split(target_namespace, "/").size();
+            size_t ns_size = namespaceIndentLevel(target_namespace);
             m_indent = string(ns_size * 4, ' ');
             m_namespace = target_namespace;
         }
@@ -338,12 +347,12 @@ namespace
     {
 	m_stream << m_indent << "enum " << type.getBasename() << " { ";
 
-	utilmm::stringlist symbols;
+        list<string> symbols;
         Enum::ValueMap const& values = type.values();
 	Enum::ValueMap::const_iterator it, end = values.end();
 	for (it = values.begin(); it != end; ++it)
 	    symbols.push_back(it->first);
-	m_stream << utilmm::join(symbols, ", ") << " };\n";
+	m_stream << join(symbols, ", ") << " };\n";
 
         return true;
     }
@@ -393,9 +402,7 @@ void IDLExport::end
     generateTypedefs(stream);
 
     // Close the remaining namespaces
-    utilmm::stringlist
-	ns_levels = utilmm::split(m_namespace, "/");
-    closeNamespaces(stream, ns_levels.size());
+    closeNamespaces(stream, namespaceIndentLevel(m_namespace));
 }
 
 void IDLExport::closeNamespaces(ostream& stream, int levels)
@@ -424,9 +431,9 @@ void IDLExport::adaptNamespace(ostream& stream, string const& ns)
 {
     if (m_namespace != ns)
     {
-	utilmm::stringlist
-	    old_namespace = utilmm::split(m_namespace, "/"),
-	    new_namespace = utilmm::split(ns, "/");
+        list<string>
+            old_namespace = nameSplit(m_namespace),
+            new_namespace = nameSplit(ns);
 
 	while(!old_namespace.empty() && !new_namespace.empty() && old_namespace.front() == new_namespace.front())
 	{
@@ -578,7 +585,7 @@ bool IDLExport::save
 	if (m_blob_threshold && static_cast<int>(type->getSize()) > m_blob_threshold)
 	{
             string target_namespace = getIDLAbsoluteNamespace(type.getNamespace(), *this);
-            size_t ns_size = utilmm::split(target_namespace, "/").size();
+            size_t ns_size = namespaceIndentLevel(target_namespace);
             string indent_string = string(ns_size * 4, ' ');
 
 	    adaptNamespace(stream, target_namespace);

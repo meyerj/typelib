@@ -44,11 +44,11 @@ namespace Typelib
     public:
         virtual ~Exporter() {}
 
-	/** Serialize a whole registry in a file */
-	virtual void save
-	    ( std::string const& file_name
-	    , utilmm::config_set const& config
-	    , Registry const& registry );
+        /** Serialize a whole registry into a file, overwriting an existing
+         * file. will throw on any errors. */
+        virtual void save(std::string const &file_name,
+                          utilmm::config_set const &config,
+                          Registry const &registry);
 
         /** Serialize a whole registry using this exporter
          * 
@@ -68,15 +68,6 @@ namespace Typelib
         virtual void save
             ( std::ostream& stream
 	    , utilmm::config_set const& config
-            , Registry const& registry );
-
-	/** \overload
-	 * This version of \c save is provided for backward-compatibility only
-	 *
-	 * @return true if the export has succeeded, false otherwise
-	 */
-        virtual bool save
-            ( std::ostream& stream
             , Registry const& registry );
 
         /** Serialize one type in \c stream. It is called by Registry::save(ostream&, Registry const&) 

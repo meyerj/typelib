@@ -29,10 +29,11 @@ static VALUE compound_get_fields(VALUE self)
         VALUE field_name = rb_str_new2(it->getName().c_str());
         VALUE field_type = cxx2rb::type_wrap(it->getType(), registry);
 
-        VALUE field_def = rb_ary_new2(3);
+        VALUE field_def = rb_ary_new2(4);
         rb_ary_store(field_def, 0, field_name);
         rb_ary_store(field_def, 1, INT2FIX(it->getOffset()));
         rb_ary_store(field_def, 2, field_type);
+        rb_ary_store(field_def, 3, cxx2rb::metadata_wrap(it->getMetaData()));
         rb_ary_push(fieldlist, field_def);
     }
 
@@ -386,8 +387,9 @@ static VALUE numeric_type_unsigned_p(VALUE self)
 	case Numeric::UInt: return Qtrue;
 	case Numeric::Float:
 	    rb_raise(rb_eArgError, "not an integral type");
+        default:
+            return Qnil;
     }
-    return Qnil; // never reached
 }
 
 
@@ -572,10 +574,8 @@ static VALUE container_erase(VALUE self, VALUE obj)
 
 bool container_delete_if_i(Value v, VALUE registry, VALUE container)
 {
-    VALUE rb_v = cxx2rb::value_wrap(v, registry, container);
-    if (RTEST(rb_yield(rb_v)))
-        return true;
-    return false;
+    VALUE rb_v = typelib_to_ruby(v, registry, container);
+    return RTEST(rb_yield(rb_v));
 }
 
 /*
@@ -607,6 +607,42 @@ static VALUE vector_contained_memory_id(VALUE self)
     if (vector->empty())
         return Qnil;
     return ULL2NUM(reinterpret_cast<uint64_t>(&(*vector)[0]));
+}
+
+/*
+ * call-seq:
+ *  vector.raw_memcpy(source,size) => nil
+ *
+ * @param [Integer] source the source raw address
+ * @param [Integer] size the number of bytes to be copied
+ */
+static VALUE vector_raw_memcpy(VALUE self,VALUE _source,VALUE _size)
+{
+    Value container_v = rb2cxx::object<Value>(self);
+    Container const& container_t = static_cast<Container const&>(container_v.getType());
+    bool is_memcpy = false;
+    bool no_layout = false;
+    try
+    {
+        MemoryLayout ops = Typelib::layout_of(container_t.getIndirection());
+        is_memcpy = (ops.size() == 2 && ops[0] == MemLayout::FLAG_MEMCPY);
+    }
+    catch(std::runtime_error) { no_layout = true; }
+    if(no_layout)
+        rb_raise(rb_eTypeError, "no layout available for elements of %s", container_t.getName().c_str());
+    if(!is_memcpy)
+        rb_raise(rb_eTypeError, "raw_memcpy is not supported for vectors of type %s", container_t.getName().c_str());
+
+    unsigned int element_size = container_t.getIndirection().getSize();
+    unsigned int size = NUM2UINT(_size);
+    if (size % element_size)
+        rb_raise(rb_eArgError, "provided size in bytes (%u) is not a round number of elements for vectors of type %s (each element is %u bytes in size)", size, container_t.getName().c_str(), element_size);
+
+    std::vector<uint8_t> *vector = reinterpret_cast<std::vector<uint8_t>*>(container_v.getData());
+    const void *source = reinterpret_cast<const void*>(NUM2ULL(_source));
+    vector->resize(size);
+    memcpy(&(*vector)[0],source,size);
+    return Qnil;
 }
 
 /* 
@@ -725,5 +761,6 @@ void typelib_ruby::Typelib_init_specialized_types()
 
     VALUE mVector = rb_define_module_under(cContainer, "StdVector");
     rb_define_method(mVector, "contained_memory_id", RUBY_METHOD_FUNC(vector_contained_memory_id), 0);
+    rb_define_method(mVector, "raw_memcpy", RUBY_METHOD_FUNC(vector_raw_memcpy), 2);
 }
 

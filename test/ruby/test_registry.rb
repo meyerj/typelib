@@ -1,7 +1,6 @@
-require './test_config'
-require 'set'
+require 'typelib/test'
 
-class TC_Registry < Test::Unit::TestCase
+class TC_Registry < Minitest::Test
     Registry = Typelib::Registry
     CXXRegistry = Typelib::CXXRegistry
     def test_aliasing
@@ -67,7 +66,7 @@ class TC_Registry < Test::Unit::TestCase
         old_size   = test_type.size
         old_layout = test_type.enum_for(:get_fields).to_a.dup
 
-        assert_not_equal(old_size, 64)
+        refute_equal(old_size, 64)
         reg.resize(container => 64)
         new_layout = test_type.enum_for(:get_fields).to_a.dup
 
@@ -80,12 +79,12 @@ class TC_Registry < Test::Unit::TestCase
 	reg = make_registry
 
 	values = Typelib.log_silent { reg.each.to_a }
-	assert_not_equal(0, values.size)
+	refute_equal(0, values.size)
 	assert(values.include?(reg.get("/int")))
 	assert(values.include?(reg.get("/EContainer")))
 
 	values = reg.each(:with_aliases => true).to_a
-	assert_not_equal(0, values.size)
+	refute_equal(0, values.size)
 	assert(values.include?(["/EContainer", reg.get("/EContainer")]))
 
 	values = reg.each('/NS1').to_a
@@ -188,19 +187,19 @@ class TC_Registry < Test::Unit::TestCase
 
     def test_create_enum
         reg = make_registry
-        t = reg.create_enum('/NewEnum') do |t|
-            t.VAL0
-            t.VAL1 = -1
-            t.VAL2
+        t = reg.create_enum('/NewEnum') do |enum_t|
+            enum_t.VAL0
+            enum_t.VAL1 = -1
+            enum_t.VAL2
         end
 
         assert_equal({'VAL0' => 0, 'VAL1' => -1, 'VAL2' => 0}, t.keys)
 
         assert_raises(ArgumentError) do
-            reg.create_enum('NewEnum') { |t| t.VAL0 }
+            reg.create_enum('NewEnum') { |enum_t| enum_t.VAL0 }
         end
         assert_raises(ArgumentError) do
-            reg.create_enum('/NewEnum') { |t| }
+            reg.create_enum('/NewEnum') { |enum_t| }
         end
     end
 
@@ -256,6 +255,72 @@ class TC_Registry < Test::Unit::TestCase
         assert_equal(10, type.offset_of('field1'))
         assert_same(reg.get('double[29459]'), type['field2'])
         assert_equal(10 + type['field1'].size, type.offset_of('field2'))
+    end
+
+    def test_merge_keeps_metadata
+        reg = Typelib::Registry.new
+        Typelib::Registry.add_standard_cxx_types(reg)
+        type = reg.create_compound '/Test' do |c|
+            c.add 'field', 'double'
+        end
+        type.metadata.set('k', 'v')
+        type.field_metadata['field'].set('k', 'v')
+        new_reg = Typelib::Registry.new
+        new_reg.merge(reg)
+        new_type = new_reg.get('/Test')
+        assert_equal [['k', ['v']]], new_type.metadata.each.to_a
+        assert_equal [['k', ['v']]], new_type.field_metadata['field'].each.to_a
+    end
+
+    def test_minimal_keeps_metadata
+        reg = Typelib::Registry.new
+        Typelib::Registry.add_standard_cxx_types(reg)
+        type = reg.create_compound '/Test' do |c|
+            c.add 'field', 'double'
+        end
+        type.metadata.set('k', 'v')
+        type.field_metadata['field'].set('k', 'v')
+        new_reg = reg.minimal('/Test')
+        new_type = new_reg.get('/Test')
+        assert_equal [['k', ['v']]], new_type.metadata.each.to_a
+        assert_equal [['k', ['v']]], new_type.field_metadata['field'].each.to_a
+    end
+
+    def test_create_opaque_raises_ArgumentError_if_the_name_is_already_used
+        reg = Typelib::Registry.new
+        reg.create_opaque '/Test', 10
+        assert_raises(ArgumentError) { reg.create_opaque '/Test', 10 }
+    end
+
+    def test_create_null_raises_ArgumentError_if_the_name_is_already_used
+        reg = Typelib::Registry.new
+        reg.create_null '/Test'
+        assert_raises(ArgumentError) { reg.create_null '/Test' }
+    end
+
+    def test_reverse_depends_resolves_recursively
+        reg = Typelib::Registry.new
+        Typelib::Registry.add_standard_cxx_types(reg)
+        compound_t = reg.create_compound '/C' do |c|
+            c.add 'field', 'double'
+        end
+        vector_t = reg.create_container '/std/vector', compound_t
+        array_t  = reg.create_array vector_t, 10
+        assert_equal [compound_t, array_t, vector_t].to_set,
+            reg.reverse_depends(compound_t).to_set
+    end
+
+    def test_remove_removes_the_types_and_its_dependencies
+        reg = Typelib::Registry.new
+        Typelib::Registry.add_standard_cxx_types(reg)
+        compound_t = reg.create_compound '/C' do |c|
+            c.add 'field', 'double'
+        end
+        vector_t = reg.create_container '/std/vector', compound_t
+        reg.create_array vector_t, 10
+        reg.remove(compound_t)
+        assert !reg.include?("/std/vector</C>")
+        assert !reg.include?("/std/vector</C>[10]")
     end
 end
 

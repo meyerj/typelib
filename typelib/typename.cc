@@ -1,17 +1,14 @@
 #include "typename.hh"
 #include <boost/static_assert.hpp>
-#include <utilmm/stringtools.hh>
 #include <iostream>
 
 using namespace std;
 using namespace boost;
 using namespace Typelib;
-using namespace utilmm;
 
 namespace
 {
     typedef std::string::value_type   NamespaceMarkType;
-    static const NamespaceMarkType    NamespaceMark = '/';
     static const char*                NamespaceMarkString = "/";
 
     struct NameSeparator : public char_separator<NamespaceMarkType>
@@ -50,7 +47,7 @@ namespace Typelib
 
     static bool isValidTypeBasename(std::string s, bool absolute, bool accept_integers)
     {
-        if (accept_integers && s.find_first_not_of("0123456789") == string::npos)
+        if (accept_integers && s.find_first_not_of("-0123456789") == string::npos)
             return true;
 
         int pos = 0;

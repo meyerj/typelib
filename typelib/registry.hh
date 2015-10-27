@@ -109,7 +109,7 @@ namespace Typelib
         static bool isPersistent(std::string const& name, Type const& type, std::string const& source_id);
         void add(std::string const& name, Type* new_type, bool persistent, std::string const& source_id);
 
-        /** Returns the set of types that depend on \c type
+        /** Returns the set of types that depend on \c type recursively
          */
         std::set<Type*> reverseDepends(Type const& type);
 
@@ -156,7 +156,7 @@ namespace Typelib
         std::string source(Type const* type) const;
 
         /** Build a derived type from its canonical name */
-        Type const* build(const std::string& name);
+        Type const* build(const std::string& name, std::size_t size = 0);
 
         /** Gets a Type object
          * @arg name the type name
@@ -176,7 +176,7 @@ namespace Typelib
          * You should not be using it. This is for internal Typelib use only */
         Type* get_(const std::string& name);
 
-        /** Returns the set of types that depend on \c type
+        /** Returns the set of types that depend on \c type recursively
          */
         std::set<Type const*> reverseDepends(Type const& type) const;
 
@@ -259,6 +259,10 @@ namespace Typelib
 
 	/** Merges the content of \c registry into this object */
 	void merge(Registry const& registry);
+
+        /** Merge the metadata information contained in a registry into this one
+         */
+	void mergeMetaData(Registry const& registry);
 
         /** Modifies the size of a subset of the types, and propagate this size
          * change to the other types

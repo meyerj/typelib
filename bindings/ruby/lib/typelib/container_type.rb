@@ -8,7 +8,7 @@ module Typelib
 
         attr_reader :element_t
 
-        def initialize(*args)
+        def typelib_initialize
             super
             @element_t = self.class.deference
             @elements = []
@@ -88,12 +88,12 @@ module Typelib
             # checks
             def get_no_boundary_check(index)
                 if @elements[index]
-                    return Typelib.to_ruby(@elements[index], element_t)
+                    return __element_to_ruby(@elements[index])
                 else
                     value = do_get(index, false)
                     if value.kind_of?(Typelib::Type)
                         @elements[index] = value
-                        Typelib.to_ruby(value, element_t)
+                        __element_to_ruby(value)
                     else value
                     end
                 end
@@ -106,6 +106,10 @@ module Typelib
                     raise ArgumentError, "index out of bounds (#{index} >= #{size})"
                 end
                 raw_get_no_boundary_check(index)
+            end
+
+            def raw_get_cached(index)
+                @elements[index]
             end
 
             # Returns the value at the given index
@@ -141,7 +145,7 @@ module Typelib
             end
 
             def []=(index, value)
-                v = Typelib.from_ruby(value, element_t)
+                v = __element_from_ruby(value)
                 raw_set(index, v)
             end
 
@@ -214,6 +218,13 @@ module Typelib
             # This is done last so that convertions to ruby that refer to this
             # type by name can override the default convertion above
             super if defined? super
+
+            if deference.needs_convertion_to_ruby?
+                include ConvertToRuby
+            end
+            if deference.needs_convertion_from_ruby?
+                include ConvertFromRuby
+            end
         end
 
         # DEPRECATED. Use #push instead
@@ -243,10 +254,10 @@ module Typelib
             if invalidated? 
                 # All children have been invalidated already by #invalidate
             elsif memory_id && (memory_id != self.contained_memory_id)
-                Typelib.debug { "invalidating all elements in #{self}" }
+                Typelib.debug { "invalidating all elements in #{raw_to_s}" }
                 invalidate_children
             elsif @elements.size > self.size
-                Typelib.debug { "invalidating #{@elements.size - self.size} trailing elements in #{self}" }
+                Typelib.debug { "invalidating #{@elements.size - self.size} trailing elements in #{raw_to_s}" }
                 while @elements.size > self.size
                     if el = @elements.pop
                         el.invalidate
@@ -255,15 +266,39 @@ module Typelib
             end
         end
 
+        module ConvertToRuby
+            def __element_to_ruby(value)
+                Typelib.to_ruby(value, element_t)
+            end
+        end
+        module ConvertFromRuby
+            def __element_from_ruby(value)
+                Typelib.from_ruby(value, element_t)
+            end
+        end
+
+        def __element_to_ruby(value)
+            value
+        end
+
+        def __element_from_ruby(value)
+            value
+        end
+
         def concat(array)
             # NOTE: no need to care about convertions to ruby here, as -- when
             # the elements require a convertion to ruby -- we convert the whole
             # container to Array
             allocating_operation do
                 for v in array
-                    do_push(Typelib.from_ruby(v, element_t))
+                    do_push(__element_from_ruby(v))
                 end
             end
+            self
+        end
+
+        def raw_each_cached(&block)
+            @elements.compact.each(&block)
         end
 
         def raw_each
@@ -284,7 +319,7 @@ module Typelib
             do_each(false) do |el|
                 if el.kind_of?(Typelib::Type)
                     el = (@elements[idx] ||= el)
-                    el = Typelib.to_ruby(el, element_t)
+                    el = __element_to_ruby(el)
                 end
 
                 yield(el)
@@ -297,9 +332,8 @@ module Typelib
             # NOTE: no need to care about convertions to ruby here, as -- when
             # the elements require a convertion to ruby -- we convert the whole
             # container to Array
-            handle_container_invalidation do
-                el = Typelib.from_ruby(el, element_t)
-                do_erase(el)
+            handle_invalidation do
+                do_erase(__element_from_ruby(el))
             end
         end
 
@@ -308,9 +342,9 @@ module Typelib
             # NOTE: no need to care about convertions to ruby here, as -- when
             # the elements require a convertion to ruby -- we convert the whole
             # container to Array
-            handle_container_invalidation do
+            handle_invalidation do
                 do_delete_if do |el|
-                    yield(Typelib.to_ruby(el, element_t))
+                    yield(__element_to_ruby(el))
                 end
             end
         end
@@ -335,6 +369,45 @@ module Typelib
 	    end
 	    pp.breakable
 	    pp.text ']'
+        end
+
+        # Returns the description of a type using only simple ruby objects
+        # (Hash, Array, Numeric and String).
+        # 
+        #    { name: TypeName,
+        #      class: NameOfTypeClass, # CompoundType, ...
+        #       # The content of 'element' is controlled by the :recursive option
+        #      element: DescriptionOfArrayElement,
+        #      size: SizeOfTypeInBytes # Only if :layout_info is true
+        #    }
+        #
+        # @option (see Type#to_h)
+        # @return (see Type#to_h)
+        def self.to_h(options = Hash.new)
+            info = super
+            info[:element] =
+                if options[:recursive]
+                    deference.to_h(options)
+                else
+                    deference.to_h_minimal(options)
+                end
+            info
+        end
+
+        # (see Type#to_simple_value)
+        #
+        # Container types are returned as either an array of their converted
+        # elements, or the hash described for the :pack_simple_arrays option. In
+        # the latter case, a 'size' field is added with the number of elements
+        # in the container to allow for validation on the receiving end.
+        def to_simple_value(options = Hash.new)
+            if options[:pack_simple_arrays] && element_t.respond_to?(:pack_code)
+                Hash[pack_code: element_t.pack_code,
+                     size: size,
+                     data: Base64.strict_encode64(to_byte_array[8..-1])]
+            else
+                raw_each.map { |v| v.to_simple_value(options) }
+            end
         end
     end
 end
